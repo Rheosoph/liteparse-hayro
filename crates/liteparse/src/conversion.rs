@@ -462,3 +462,120 @@ pub async fn convert_data_to_pdf(
     tokio::fs::write(&tmp_path, data).await?;
     convert_to_pdf(tmp_path.to_str().unwrap(), password).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_pdf() {
+        assert!(is_pdf("foo.pdf"));
+        assert!(is_pdf("foo.PDF"));
+        assert!(is_pdf("/abs/dir/Bar.Pdf"));
+        assert!(!is_pdf("foo.docx"));
+        assert!(!is_pdf("foo"));
+        assert!(!is_pdf(""));
+    }
+
+    #[test]
+    fn test_is_supported_extension() {
+        assert!(is_supported_extension("a.pdf"));
+        assert!(is_supported_extension("A.DOCX"));
+        assert!(is_supported_extension("a.pptx"));
+        assert!(is_supported_extension("a.xlsx"));
+        assert!(is_supported_extension("a.png"));
+        assert!(is_supported_extension("a.svg"));
+        assert!(!is_supported_extension("a.exe"));
+        assert!(!is_supported_extension("noext"));
+    }
+
+    #[test]
+    fn test_conversion_tool_display() {
+        assert_eq!(ConverstionTool::ImageMagick.to_string(), "ImageMagick");
+        assert_eq!(ConverstionTool::LibreOffice.to_string(), "LibreOffice");
+    }
+
+    #[test]
+    fn test_get_resolved_path_from_output_first_and_last() {
+        let out = "  /usr/bin/foo\n\n/opt/bin/foo\n";
+        assert_eq!(
+            get_resolved_path_from_output(out, false).as_deref(),
+            Some("/usr/bin/foo")
+        );
+        assert_eq!(
+            get_resolved_path_from_output(out, true).as_deref(),
+            Some("/opt/bin/foo")
+        );
+    }
+
+    #[test]
+    fn test_get_resolved_path_from_output_empty() {
+        assert!(get_resolved_path_from_output("", false).is_none());
+        assert!(get_resolved_path_from_output("   \n  \n", true).is_none());
+    }
+
+    #[test]
+    fn test_is_windows_system_convert() {
+        // SAFETY: tests run single-threaded for env modification scope
+        unsafe { std::env::set_var("SystemRoot", "C:\\Windows") };
+        assert!(is_windows_system_convert(
+            "C:\\Windows\\System32\\convert.exe"
+        ));
+        assert!(is_windows_system_convert("C:/Windows/System32/convert.exe"));
+        assert!(!is_windows_system_convert(
+            "C:\\Program Files\\ImageMagick\\convert.exe"
+        ));
+    }
+
+    #[test]
+    fn test_guess_extension_from_data_png() {
+        let png_header = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        assert_eq!(
+            guess_extension_from_data(&png_header).as_deref(),
+            Some("png")
+        );
+    }
+
+    #[test]
+    fn test_guess_extension_from_data_unknown() {
+        assert!(guess_extension_from_data(&[0u8, 1, 2, 3]).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_failure() {
+        let r = execute_command("ls", vec!["/this/definitely/does/not/exist"], 5000).await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_timeout() {
+        let r = execute_command("sleep", vec!["5"], 50).await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_spawn_error() {
+        let r = execute_command("definitely_not_a_real_command_xyz123", vec![], 1000).await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_is_path_executable_nonexistent() {
+        assert!(!is_path_executable("/no/such/path/zzz").await);
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_pdf_passthrough_pdf() {
+        let res = convert_to_pdf("/some/file.pdf", None).await.unwrap();
+        assert_eq!(res.pdf_path, "/some/file.pdf");
+        assert_eq!(res.original_extension, "pdf");
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_pdf_unsupported() {
+        let r = convert_to_pdf("/some/file.xyz", None).await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("unsupported"));
+    }
+}

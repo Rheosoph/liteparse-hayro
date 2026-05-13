@@ -191,4 +191,60 @@ mod tests {
         assert_eq!(clean_ocr_table_artifacts(""), "");
         assert_eq!(clean_ocr_table_artifacts("|||"), "|||");
     }
+
+    fn make_item(x: f32, y: f32, w: f32, h: f32) -> TextItem {
+        TextItem {
+            text: "x".into(),
+            x,
+            y,
+            width: w,
+            height: h,
+            rotation: 0.0,
+            font_name: None,
+            font_size: None,
+            font_height: None,
+            font_ascent: None,
+            font_descent: None,
+            font_weight: None,
+            font_flags: None,
+            text_width: None,
+            font_is_buggy: false,
+            mcid: None,
+            fill_color: None,
+            stroke_color: None,
+            confidence: None,
+        }
+    }
+
+    #[test]
+    fn test_overlaps_existing_text_inside() {
+        let items = vec![make_item(10.0, 10.0, 20.0, 5.0)];
+        assert!(overlaps_existing_text(&items, 12.0, 11.0, 5.0, 2.0, 2.0));
+    }
+
+    #[test]
+    fn test_overlaps_existing_text_disjoint() {
+        let items = vec![make_item(10.0, 10.0, 20.0, 5.0)];
+        assert!(!overlaps_existing_text(&items, 100.0, 100.0, 5.0, 5.0, 2.0));
+    }
+
+    #[test]
+    fn test_overlaps_existing_text_tolerance() {
+        let items = vec![make_item(10.0, 10.0, 20.0, 5.0)];
+        // Just outside but within tolerance
+        assert!(overlaps_existing_text(&items, 31.0, 10.0, 5.0, 5.0, 2.0));
+        // Beyond tolerance
+        assert!(!overlaps_existing_text(&items, 35.0, 10.0, 5.0, 5.0, 2.0));
+    }
+
+    #[test]
+    fn test_overlaps_empty() {
+        assert!(!overlaps_existing_text(&[], 0.0, 0.0, 1.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn test_clean_ocr_keeps_whitespace_trimmed() {
+        assert_eq!(clean_ocr_table_artifacts("   "), "");
+        assert_eq!(clean_ocr_table_artifacts(" 123 "), "123");
+    }
 }

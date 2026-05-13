@@ -746,3 +746,184 @@ impl SegmentBuilder {
         self.pending_space = false;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f32::consts::PI;
+
+    fn ti(text: &str, x: f32, y: f32, w: f32, h: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: w,
+            height: h,
+            rotation: 0.0,
+            font_name: None,
+            font_size: None,
+            font_height: None,
+            font_ascent: None,
+            font_descent: None,
+            font_weight: None,
+            font_flags: None,
+            text_width: None,
+            font_is_buggy: false,
+            mcid: None,
+            fill_color: None,
+            stroke_color: None,
+            confidence: None,
+        }
+    }
+
+    #[test]
+    fn dedup_drops_earlier_exact_duplicate() {
+        let mut items = vec![
+            ti("hello", 0.0, 0.0, 10.0, 5.0),
+            ti("hello", 1.0, 0.0, 10.0, 5.0),
+        ];
+        dedup_overlapping_items(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].x, 1.0);
+    }
+
+    #[test]
+    fn dedup_keeps_non_overlapping() {
+        let mut items = vec![ti("a", 0.0, 0.0, 5.0, 5.0), ti("b", 100.0, 100.0, 5.0, 5.0)];
+        dedup_overlapping_items(&mut items);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn dedup_drops_earlier_when_different_text_overlaps_heavily() {
+        let mut items = vec![
+            ti("old", 0.0, 0.0, 10.0, 5.0),
+            ti("new", 0.0, 0.0, 10.0, 5.0),
+        ];
+        dedup_overlapping_items(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "new");
+    }
+
+    #[test]
+    fn dedup_keeps_both_when_different_text_overlaps_lightly() {
+        let mut items = vec![
+            ti("aaa", 0.0, 0.0, 10.0, 5.0),
+            ti("bbb", 9.0, 0.0, 10.0, 5.0),
+        ];
+        dedup_overlapping_items(&mut items);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn dedup_noop_for_empty_or_single() {
+        let mut empty: Vec<TextItem> = vec![];
+        dedup_overlapping_items(&mut empty);
+        assert!(empty.is_empty());
+        let mut one = vec![ti("x", 0.0, 0.0, 1.0, 1.0)];
+        dedup_overlapping_items(&mut one);
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn adjust_angle_no_rotation() {
+        assert!((adjust_angle_for_rotation(0.5, 0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn adjust_angle_180() {
+        let r = adjust_angle_for_rotation(PI, 2);
+        assert!(r.abs() < 1e-5 || (r - 2.0 * PI).abs() < 1e-5);
+    }
+
+    #[test]
+    fn adjust_angle_wraps_into_0_2pi() {
+        let r = adjust_angle_for_rotation(0.0, 1);
+        assert!((0.0..2.0 * PI).contains(&r));
+    }
+
+    #[test]
+    fn decompose_scale_identity() {
+        let m = pdfium::Matrix {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        };
+        let (sx, sy) = decompose_scale(&m);
+        assert!((sx - 1.0).abs() < 1e-5);
+        assert!((sy - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn decompose_scale_uniform() {
+        let m = pdfium::Matrix {
+            a: 2.0,
+            b: 0.0,
+            c: 0.0,
+            d: 2.0,
+            e: 0.0,
+            f: 0.0,
+        };
+        let (sx, sy) = decompose_scale(&m);
+        assert!((sx - 2.0).abs() < 1e-4);
+        assert!((sy - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn buggy_font_truetype_subset_prefix() {
+        assert!(is_buggy_font("TTFoo", FontType::TrueType));
+        assert!(is_buggy_font("ABCDEF+TTBar", FontType::TrueType));
+        assert!(!is_buggy_font("Arial", FontType::TrueType));
+    }
+
+    #[test]
+    fn buggy_font_type1_underscore() {
+        assert!(is_buggy_font("ABCDEF_Foo", FontType::Type1));
+        assert!(!is_buggy_font("ABCDEF_Foo", FontType::TrueType));
+        assert!(!is_buggy_font("Short", FontType::Type1));
+    }
+
+    #[test]
+    fn buggy_codepoint_ranges() {
+        assert!(is_buggy_codepoint(0x00));
+        assert!(is_buggy_codepoint(0x1F));
+        assert!(!is_buggy_codepoint(0x20));
+        assert!(is_buggy_codepoint(0xE001));
+        assert!(is_buggy_codepoint(0xF8FF));
+        assert!(!is_buggy_codepoint(0xE000));
+        assert!(!is_buggy_codepoint(0xF900));
+    }
+
+    #[test]
+    fn color_to_argb_hex_formats() {
+        let c = pdfium::Color {
+            r: 0xAB,
+            g: 0xCD,
+            b: 0xEF,
+            a: 0x12,
+        };
+        assert_eq!(color_to_argb_hex(&c), "12abcdef");
+        let z = pdfium::Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        };
+        assert_eq!(color_to_argb_hex(&z), "00000000");
+    }
+
+    #[test]
+    fn extract_pages_missing_file_errors() {
+        let res = extract_pages("/nonexistent/path/does-not-exist.pdf", None);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn extract_pages_filtered_missing_file_errors() {
+        let res = extract_pages_filtered("/nonexistent/path/does-not-exist.pdf", None, 10, None);
+        assert!(res.is_err());
+    }
+}

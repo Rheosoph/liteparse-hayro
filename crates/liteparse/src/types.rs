@@ -113,3 +113,92 @@ pub struct ProjectedTextItem {
 }
 
 pub type AnchorMap = HashMap<i32, Vec<(usize, usize)>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_item() -> TextItem {
+        TextItem {
+            text: "hi".into(),
+            x: 1.0,
+            y: 2.0,
+            width: 10.0,
+            height: 4.0,
+            rotation: 0.0,
+            font_name: Some("Arial".into()),
+            font_size: Some(12.0),
+            font_height: None,
+            font_ascent: None,
+            font_descent: None,
+            font_weight: None,
+            font_flags: None,
+            text_width: None,
+            font_is_buggy: false,
+            mcid: None,
+            fill_color: None,
+            stroke_color: None,
+            confidence: None,
+        }
+    }
+
+    #[test]
+    fn output_format_serializes() {
+        assert_eq!(
+            serde_json::to_string(&OutputFormat::Json).unwrap(),
+            "\"Json\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OutputFormat::Text).unwrap(),
+            "\"Text\""
+        );
+    }
+
+    #[test]
+    fn input_type_roundtrip() {
+        let v = InputType::FilePath("/tmp/x.pdf".into());
+        let s = serde_json::to_string(&v).unwrap();
+        let back: InputType = serde_json::from_str(&s).unwrap();
+        match back {
+            InputType::FilePath(p) => assert_eq!(p, "/tmp/x.pdf"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn text_item_skips_none_fields() {
+        let item = sample_item();
+        let s = serde_json::to_string(&item).unwrap();
+        assert!(!s.contains("font_height"));
+        assert!(!s.contains("confidence"));
+        assert!(!s.contains("font_is_buggy"));
+        assert!(s.contains("\"text\":\"hi\""));
+    }
+
+    #[test]
+    fn text_item_includes_buggy_flag_when_true() {
+        let mut item = sample_item();
+        item.font_is_buggy = true;
+        let s = serde_json::to_string(&item).unwrap();
+        assert!(s.contains("font_is_buggy"));
+    }
+
+    #[test]
+    fn page_serializes() {
+        let p = Page {
+            page_number: 1,
+            page_width: 100.0,
+            page_height: 200.0,
+            text_items: vec![sample_item()],
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"page_number\":1"));
+    }
+
+    #[test]
+    fn anchor_map_basic() {
+        let mut m: AnchorMap = HashMap::new();
+        m.entry(5).or_default().push((1, 2));
+        assert_eq!(m.get(&5).unwrap()[0], (1, 2));
+    }
+}

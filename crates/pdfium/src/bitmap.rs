@@ -56,6 +56,7 @@ impl Bitmap {
                 width,
                 height,
                 // necessary for windows -> expected `u32`, found `u64`
+                #[allow(clippy::useless_conversion)]
                 color.try_into().unwrap(),
             );
         }

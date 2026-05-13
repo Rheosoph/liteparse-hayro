@@ -127,3 +127,54 @@ impl LiteParse {
         &self.config
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ParsedPage;
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_new_stores_config() {
+        let mut cfg = LiteParseConfig::default();
+        cfg.ocr_enabled = false;
+        cfg.max_pages = 7;
+        let lp = LiteParse::new(cfg);
+        assert!(!lp.config().ocr_enabled);
+        assert_eq!(lp.config().max_pages, 7);
+    }
+
+    fn fake_result() -> ParseResult {
+        ParseResult {
+            pages: vec![ParsedPage {
+                page_number: 1,
+                page_width: 100.0,
+                page_height: 200.0,
+                text: "hello".into(),
+                text_items: vec![],
+            }],
+            text: "hello".into(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_format_json() {
+        let mut cfg = LiteParseConfig::default();
+        cfg.output_format = OutputFormat::Json;
+        let lp = LiteParse::new(cfg);
+        let s = lp.format(&fake_result()).unwrap();
+        assert!(s.contains("\"page\""));
+        assert!(s.contains("\"hello\""));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_format_text() {
+        let mut cfg = LiteParseConfig::default();
+        cfg.output_format = OutputFormat::Text;
+        let lp = LiteParse::new(cfg);
+        let s = lp.format(&fake_result()).unwrap();
+        assert!(s.contains("hello"));
+    }
+}

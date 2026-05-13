@@ -121,3 +121,42 @@ fn default_tessdata_dir() -> String {
     }
     "tessdata".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_language_known_codes() {
+        assert_eq!(TesseractOcrEngine::normalize_language("en"), "eng");
+        assert_eq!(TesseractOcrEngine::normalize_language("EN"), "eng");
+        assert_eq!(TesseractOcrEngine::normalize_language(" fr "), "fra");
+        assert_eq!(TesseractOcrEngine::normalize_language("zh"), "chi_sim");
+        assert_eq!(TesseractOcrEngine::normalize_language("zh-tw"), "chi_tra");
+        assert_eq!(TesseractOcrEngine::normalize_language("ja"), "jpn");
+    }
+
+    #[test]
+    fn test_normalize_language_passthrough_for_unknown() {
+        assert_eq!(TesseractOcrEngine::normalize_language("eng"), "eng");
+        assert_eq!(TesseractOcrEngine::normalize_language("xyz"), "xyz");
+    }
+
+    #[test]
+    fn test_engine_name() {
+        let e = TesseractOcrEngine::new(None);
+        assert_eq!(e.name(), "tesseract");
+    }
+
+    #[test]
+    fn test_new_stores_tessdata_path() {
+        let e = TesseractOcrEngine::new(Some("/custom/tessdata".to_string()));
+        assert_eq!(e.tessdata_path.as_deref(), Some("/custom/tessdata"));
+    }
+
+    #[test]
+    fn test_default_tessdata_dir_non_empty() {
+        let d = default_tessdata_dir();
+        assert!(!d.is_empty());
+    }
+}

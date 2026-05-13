@@ -64,3 +64,72 @@ pub fn format_json(pages: &[ParsedPage]) -> Result<String, serde_json::Error> {
     let result = build_json(pages);
     serde_json::to_string_pretty(&result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ParsedPage, TextItem};
+
+    fn item(text: &str, conf: Option<f32>) -> TextItem {
+        TextItem {
+            text: text.into(),
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+            rotation: 0.0,
+            font_name: Some("Helv".into()),
+            font_size: Some(10.0),
+            font_height: None,
+            font_ascent: None,
+            font_descent: None,
+            font_weight: None,
+            font_flags: None,
+            text_width: None,
+            font_is_buggy: false,
+            mcid: None,
+            fill_color: None,
+            stroke_color: None,
+            confidence: conf,
+        }
+    }
+
+    fn page(items: Vec<TextItem>) -> ParsedPage {
+        ParsedPage {
+            page_number: 1,
+            page_width: 612.0,
+            page_height: 792.0,
+            text: "txt".into(),
+            text_items: items,
+        }
+    }
+
+    #[test]
+    fn test_build_json_native_text_defaults_confidence_to_one() {
+        let j = build_json(&[page(vec![item("hi", None)])]);
+        assert_eq!(j.pages.len(), 1);
+        assert_eq!(j.pages[0].page, 1);
+        assert_eq!(j.pages[0].text_items[0].confidence, Some(1.0));
+        assert_eq!(j.pages[0].text_items[0].font_name.as_deref(), Some("Helv"));
+    }
+
+    #[test]
+    fn test_build_json_preserves_ocr_confidence() {
+        let j = build_json(&[page(vec![item("hi", Some(0.42))])]);
+        assert_eq!(j.pages[0].text_items[0].confidence, Some(0.42));
+    }
+
+    #[test]
+    fn test_format_json_pretty() {
+        let s = format_json(&[page(vec![item("hi", None)])]).unwrap();
+        assert!(s.contains("\n"));
+        assert!(s.contains("\"text\": \"hi\""));
+        assert!(s.contains("\"page\": 1"));
+    }
+
+    #[test]
+    fn test_build_json_empty() {
+        let j = build_json(&[]);
+        assert!(j.pages.is_empty());
+    }
+}

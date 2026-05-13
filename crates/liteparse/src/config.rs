@@ -101,4 +101,44 @@ mod tests {
         assert!(parse_target_pages("5-3").is_err());
         assert!(parse_target_pages("abc").is_err());
     }
+
+    #[test]
+    fn test_parse_target_pages_with_whitespace() {
+        assert_eq!(parse_target_pages(" 1 , 2 - 4 ").unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_parse_target_pages_single_range() {
+        assert_eq!(parse_target_pages("2-2").unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn test_default_config() {
+        let c = LiteParseConfig::default();
+        assert_eq!(c.ocr_language, "eng");
+        assert!(c.ocr_enabled);
+        assert_eq!(c.max_pages, 1000);
+        assert_eq!(c.dpi, 150.0);
+        assert_eq!(c.output_format, OutputFormat::Json);
+        assert!(!c.preserve_very_small_text);
+        assert!(!c.quiet);
+        assert!(c.password.is_none());
+    }
+
+    #[test]
+    fn test_output_format_lowercase_serde() {
+        let s = serde_json::to_string(&OutputFormat::Json).unwrap();
+        assert_eq!(s, "\"json\"");
+        let back: OutputFormat = serde_json::from_str("\"text\"").unwrap();
+        assert_eq!(back, OutputFormat::Text);
+    }
+
+    #[test]
+    fn test_config_roundtrip() {
+        let c = LiteParseConfig::default();
+        let s = serde_json::to_string(&c).unwrap();
+        let back: LiteParseConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.ocr_language, c.ocr_language);
+        assert_eq!(back.output_format, c.output_format);
+    }
 }

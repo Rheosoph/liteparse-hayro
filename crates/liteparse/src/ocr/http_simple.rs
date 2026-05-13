@@ -94,3 +94,42 @@ impl OcrEngine for HttpOcrEngine {
         Ok(results)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_sets_name_and_url() {
+        let e = HttpOcrEngine::new("http://example.com/ocr".into());
+        assert_eq!(e.name(), "http-ocr");
+        assert_eq!(e.server_url, "http://example.com/ocr");
+    }
+
+    #[test]
+    fn test_response_deserializes() {
+        let raw = r#"{"results":[{"text":"hi","bbox":[1.0,2.0,3.0,4.0],"confidence":0.85}]}"#;
+        let parsed: HttpOcrResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.results.len(), 1);
+        assert_eq!(parsed.results[0].text, "hi");
+        assert_eq!(parsed.results[0].bbox, [1.0, 2.0, 3.0, 4.0]);
+        assert!((parsed.results[0].confidence - 0.85).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_response_deserializes_empty() {
+        let raw = r#"{"results":[]}"#;
+        let parsed: HttpOcrResponse = serde_json::from_str(raw).unwrap();
+        assert!(parsed.results.is_empty());
+    }
+
+    #[test]
+    fn test_recognize_network_error() {
+        let e = HttpOcrEngine::new("http://127.0.0.1:1/ocr".into());
+        let opts = OcrOptions {
+            language: "eng".into(),
+        };
+        let r = e.recognize(&[0u8; 4], 1, 1, &opts);
+        assert!(r.is_err());
+    }
+}

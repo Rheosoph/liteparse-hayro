@@ -98,3 +98,38 @@ pub fn image_bounds(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_image_bounds_output_serializes() {
+        let b = ImageBoundsOutput {
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+        };
+        let s = serde_json::to_string(&b).unwrap();
+        assert!(s.contains("\"x\":1"));
+        assert!(s.contains("\"width\":3"));
+    }
+
+    #[test]
+    fn test_screenshot_missing_file_errors() {
+        let r = screenshot(
+            "/nonexistent/path/does_not_exist.pdf",
+            1,
+            72.0,
+            "/tmp/out.png",
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_image_bounds_missing_file_errors() {
+        let r = image_bounds("/nonexistent/path/does_not_exist.pdf", None);
+        assert!(r.is_err());
+    }
+}

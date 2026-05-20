@@ -121,8 +121,36 @@ fn handle_rotation_reading_order(items: &mut [ProjectedTextItem], page_height: f
         groups_by_rotation.entry(r).or_default().push(idx);
     }
 
-    // Build group list sorted by each group's minimum X.
-    let mut bbox_groups: Vec<Vec<usize>> = groups_by_rotation.into_values().collect();
+    // For 90/270° groups, further split into spatially distinct clusters by y proximity.
+    // This prevents e.g. top and bottom pin labels from being merged into one group.
+    let mut bbox_groups: Vec<Vec<usize>> = Vec::new();
+    for (rot, mut group) in groups_by_rotation {
+        group.sort_by(|a, b| items[*a].item.y.total_cmp(&items[*b].item.y));
+        if (rot == 90 || rot == 270) && group.len() > 1 {
+            // Split when y gap between consecutive items exceeds a threshold
+            let max_h = group
+                .iter()
+                .map(|idx| items[*idx].item.height)
+                .fold(0.0f32, |a, b| a.max(b));
+            let gap_threshold = max_h * 3.0;
+            let mut cluster: Vec<usize> = vec![group[0]];
+            for i in 1..group.len() {
+                let prev_bottom = items[group[i - 1]].item.y + items[group[i - 1]].item.height;
+                let cur_top = items[group[i]].item.y;
+                if cur_top - prev_bottom > gap_threshold {
+                    bbox_groups.push(std::mem::take(&mut cluster));
+                }
+                cluster.push(group[i]);
+            }
+            if !cluster.is_empty() {
+                bbox_groups.push(cluster);
+            }
+        } else {
+            bbox_groups.push(group);
+        }
+    }
+
+    // Sort each subgroup by y.
     for group in &mut bbox_groups {
         group.sort_by(|a, b| items[*a].item.y.total_cmp(&items[*b].item.y));
     }
@@ -150,7 +178,9 @@ fn handle_rotation_reading_order(items: &mut [ProjectedTextItem], page_height: f
             continue;
         }
 
-        // Check if non-rotated/other-rotated items visually overlap this group (X and Y overlap).
+        // Check if non-rotated/other-rotated items visually overlap or are near this group.
+        // Use a proximity margin so rotated labels in diagrams (e.g. pin diagrams)
+        // that are close to but don't strictly overlap non-rotated items are kept inline.
         let mut global_overlap = false;
         'outer: for (other_idx, other_bbox) in items.iter().enumerate() {
             let other_rot = canonical_rotation(other_bbox.item.rotation);
@@ -163,10 +193,12 @@ fn handle_rotation_reading_order(items: &mut [ProjectedTextItem], page_height: f
                     continue;
                 }
                 let b = &items[*group_item_idx].item;
-                let x_overlap =
-                    b.x >= other_bbox.item.x && b.x <= other_bbox.item.x + other_bbox.item.width;
-                let y_overlap = b.y < other_bbox.item.y + other_bbox.item.height
-                    && b.y + b.height > other_bbox.item.y;
+                let o = &other_bbox.item;
+                // Proximity margin: use the max height of both items
+                let margin = b.height.max(o.height);
+                // Proper range overlap with margin on y-axis
+                let x_overlap = b.x < o.x + o.width && b.x + b.width > o.x;
+                let y_overlap = b.y < o.y + o.height + margin && b.y + b.height + margin > o.y;
                 if x_overlap && y_overlap {
                     global_overlap = true;
                     break 'outer;
@@ -175,13 +207,38 @@ fn handle_rotation_reading_order(items: &mut [ProjectedTextItem], page_height: f
         }
 
         if global_overlap {
-            for idx in &group {
-                if items[*idx].d != 0.0 {
-                    items[*idx].item.y += items[*idx].d;
-                    items[*idx].d = 0.0;
+            // For 90/270° groups kept inline, compute a common y from the
+            // group's average vertical midpoint so all labels land on one row.
+            // Keep original w/h to preserve x-spacing between labels.
+            if group_rotation == 90 || group_rotation == 270 {
+                let avg_cy: f32 = group
+                    .iter()
+                    .map(|idx| items[*idx].item.y + items[*idx].item.height / 2.0)
+                    .sum::<f32>()
+                    / group.len() as f32;
+                let avg_w: f32 = group.iter().map(|idx| items[*idx].item.width).sum::<f32>()
+                    / group.len() as f32;
+                let common_y = avg_cy - avg_w / 2.0;
+
+                for idx in &group {
+                    if items[*idx].d != 0.0 {
+                        items[*idx].item.y += items[*idx].d;
+                        items[*idx].d = 0.0;
+                    }
+                    items[*idx].item.y = common_y;
+                    items[*idx].item.height = avg_w;
+                    items[*idx].item.rotation = 0.0;
+                    items[*idx].rotated = true;
                 }
-                items[*idx].item.rotation = 0.0;
-                items[*idx].rotated = true;
+            } else {
+                for idx in &group {
+                    if items[*idx].d != 0.0 {
+                        items[*idx].item.y += items[*idx].d;
+                        items[*idx].d = 0.0;
+                    }
+                    items[*idx].item.rotation = 0.0;
+                    items[*idx].rotated = true;
+                }
             }
         } else {
             let group_max_x = group
@@ -567,8 +624,12 @@ fn form_lines(
                     && looks_like_table_number(&item.item.text);
 
                 let delta_x = item.item.x - prev.item.x - prev.item.width;
+                // Don't merge items with noticeably different y positions (>1.5px).
+                // Items on the same baseline typically differ by <0.5px.
+                let y_diff = (item.item.y - prev.item.y).abs();
+                let y_compatible = y_diff <= 1.5;
 
-                if !both_are_numbers && delta_x <= MERGE_THRESHOLD {
+                if y_compatible && !both_are_numbers && delta_x <= MERGE_THRESHOLD {
                     prev.item.width = item.item.x + item.item.width - prev.item.x;
                     prev.item.text.push_str(&item.item.text);
                     continue;
@@ -576,7 +637,7 @@ fn form_lines(
 
                 let prev_len = prev.item.text.chars().count().max(1) as f32;
                 let avg_char_width = prev.item.width / prev_len;
-                if !both_are_numbers && delta_x < avg_char_width {
+                if y_compatible && !both_are_numbers && delta_x < avg_char_width {
                     prev.item.width = item.item.x + item.item.width - prev.item.x;
                     if !prev.item.text.ends_with(' ') {
                         prev.item.text.push(' ');
@@ -717,13 +778,19 @@ fn anchor_to_x(key: i32) -> f32 {
     key as f32 / 4.0
 }
 
+/// Visual (character) length of a string, not byte length.
+/// Use this for column calculations instead of `.len()`.
+fn char_len(s: &str) -> usize {
+    s.chars().count()
+}
+
 fn trim_end_len(s: &str) -> usize {
-    s.trim_end().len()
+    char_len(s.trim_end())
 }
 
 fn trim_end_in_place(s: &mut String) {
-    let n = trim_end_len(s);
-    s.truncate(n);
+    let trimmed = s.trim_end().len(); // byte len for truncate
+    s.truncate(trimmed);
 }
 
 fn line_space_end(raw_line: &str, should_space: usize) -> usize {
@@ -732,7 +799,7 @@ fn line_space_end(raw_line: &str, should_space: usize) -> usize {
         space_end = should_space;
     }
     if should_space > 1 {
-        let trailing_spaces = raw_line.len().saturating_sub(trim_end_len(raw_line));
+        let trailing_spaces = char_len(raw_line).saturating_sub(trim_end_len(raw_line));
         if trailing_spaces < should_space {
             space_end = should_space - trailing_spaces;
         }
@@ -930,6 +997,12 @@ fn extract_block_anchors(
 
     for (line_idx, line) in lines.iter().enumerate().take(block.end).skip(block.start) {
         for (box_idx, bbox) in line.iter().enumerate() {
+            // Skip rotated items from anchor detection — their coordinates are
+            // transformed and would create spurious column anchors that stretch
+            // the layout. They'll render as floating items at their natural positions.
+            if bbox.rotated {
+                continue;
+            }
             let left_key = anchor_key(bbox.item.x);
             let right_key = anchor_key(bbox.item.x + bbox.item.width);
             let center_key = anchor_key(bbox.item.x + bbox.item.width * 0.5);
@@ -1057,31 +1130,6 @@ fn intercept_filter(
     }
 }
 
-/// Build a set of all (line_idx, box_idx) pairs present in any anchor map.
-fn anchored_items_set(
-    anchor_left: &HashMap<i32, Vec<(usize, usize)>>,
-    anchor_right: &HashMap<i32, Vec<(usize, usize)>>,
-    anchor_center: &HashMap<i32, Vec<(usize, usize)>>,
-) -> HashSet<(usize, usize)> {
-    let mut set = HashSet::new();
-    for members in anchor_left.values() {
-        for m in members {
-            set.insert(*m);
-        }
-    }
-    for members in anchor_right.values() {
-        for m in members {
-            set.insert(*m);
-        }
-    }
-    for members in anchor_center.values() {
-        for m in members {
-            set.insert(*m);
-        }
-    }
-    set
-}
-
 /// Try to align floating bboxes (not in any surviving anchor) to nearby anchors
 /// on adjacent lines within the given margin.
 fn try_align_floating(
@@ -1098,6 +1146,11 @@ fn try_align_floating(
     for line_idx in block.start..block.end {
         for box_idx in 0..lines[line_idx].len() {
             if anchored.contains(&(line_idx, box_idx)) {
+                continue;
+            }
+            // Skip rotated items — they are excluded from anchor extraction
+            // and should remain floating to avoid spurious snap assignments.
+            if lines[line_idx][box_idx].rotated {
                 continue;
             }
 
@@ -1547,33 +1600,44 @@ fn project_to_grid(
         intercept_filter(&mut anchor_center, &lines);
 
         // Try to align floating bboxes to nearby existing anchors
-        let anchored = anchored_items_set(&anchor_left, &anchor_right, &anchor_center);
+        // Align floating items to nearby anchors. Use type-specific skip sets
+        // so items with e.g. only a left anchor can still be aligned to a right anchor.
+        let left_anchored: HashSet<(usize, usize)> = anchor_left
+            .values()
+            .flat_map(|v| v.iter().copied())
+            .collect();
         try_align_floating(
             &mut anchor_left,
             &lines,
             block,
-            &anchored,
-            2.0,
+            &left_anchored,
+            4.0,
             |item| item.x,
             |item| anchor_key(item.x),
         );
-        let anchored = anchored_items_set(&anchor_left, &anchor_right, &anchor_center);
+        let right_anchored: HashSet<(usize, usize)> = anchor_right
+            .values()
+            .flat_map(|v| v.iter().copied())
+            .collect();
         try_align_floating(
             &mut anchor_right,
             &lines,
             block,
-            &anchored,
-            2.0,
+            &right_anchored,
+            4.0,
             |item| item.x + item.width,
             |item| anchor_key(item.x + item.width),
         );
-        let anchored = anchored_items_set(&anchor_left, &anchor_right, &anchor_center);
+        let center_anchored: HashSet<(usize, usize)> = anchor_center
+            .values()
+            .flat_map(|v| v.iter().copied())
+            .collect();
         try_align_floating(
             &mut anchor_center,
             &lines,
             block,
-            &anchored,
-            2.0,
+            &center_anchored,
+            4.0,
             |item| item.x + item.width * 0.5,
             |item| anchor_key(item.x + item.width * 0.5),
         );
@@ -1971,18 +2035,18 @@ fn project_to_grid(
                                 .map(|(_, v)| *v)
                                 .max()
                                 .unwrap_or(0),
-                            raw_lines[line_idx].len(),
+                            char_len(&raw_lines[line_idx]),
                             meta[line_idx][box_idx].should_space
                         );
                         eprintln!("[debug]   raw_line so far: '{}'", &raw_lines[line_idx]);
                     }
 
                     trim_end_in_place(&mut raw_lines[line_idx]);
-                    let before_len = raw_lines[line_idx].len();
+                    let before_len = char_len(&raw_lines[line_idx]);
                     if target_x > before_len {
                         raw_lines[line_idx].push_str(&" ".repeat(target_x - before_len));
                     }
-                    let start_x = raw_lines[line_idx].len();
+                    let start_x = char_len(&raw_lines[line_idx]);
                     raw_lines[line_idx].push_str(&bbox_text);
 
                     meta[line_idx][box_idx].rendered = true;
@@ -1997,7 +2061,7 @@ fn project_to_grid(
                         0
                     };
                     let right_bound = anchor_key(bbox_x + bbox_w);
-                    let target_len = raw_lines[line_idx].len() + next_should_space;
+                    let target_len = char_len(&raw_lines[line_idx]) + next_should_space;
 
                     update_forward_anchor_right_bound(
                         &left_snaps,
@@ -2127,7 +2191,7 @@ fn project_to_grid(
                 SnapKind::Left => turn_items
                     .iter()
                     .map(|(li, bi)| {
-                        raw_lines[*li].len()
+                        char_len(&raw_lines[*li])
                             + line_space_end(&raw_lines[*li], meta[*li][*bi].should_space)
                             + 1
                     })
@@ -2153,7 +2217,7 @@ fn project_to_grid(
                     .iter()
                     .map(|(li, bi)| {
                         let text_half = lines[*li][*bi].item.text.chars().count() / 2;
-                        raw_lines[*li].len()
+                        char_len(&raw_lines[*li])
                             + text_half
                             + line_space_end(&raw_lines[*li], meta[*li][*bi].should_space)
                     })
@@ -2210,11 +2274,11 @@ fn project_to_grid(
                 };
                 match kind {
                     SnapKind::Left => {
-                        let before = raw_lines[line_idx].len();
+                        let before = char_len(&raw_lines[line_idx]);
                         if target_x > before {
                             raw_lines[line_idx].push_str(&" ".repeat(target_x - before));
                         }
-                        let start_x = raw_lines[line_idx].len();
+                        let start_x = char_len(&raw_lines[line_idx]);
                         raw_lines[line_idx].push_str(&bbox_text);
                         meta[line_idx][box_idx].projected_x = start_x;
                         lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before);
@@ -2222,25 +2286,25 @@ fn project_to_grid(
                     SnapKind::Right => {
                         trim_end_in_place(&mut raw_lines[line_idx]);
                         let text_len = bbox_text.chars().count();
-                        let before = raw_lines[line_idx].len();
+                        let before = char_len(&raw_lines[line_idx]);
                         let trim_len = trim_end_len(&raw_lines[line_idx]);
                         if target_x > trim_len + text_len {
-                            let pad = target_x - raw_lines[line_idx].len() - text_len;
+                            let pad = target_x - char_len(&raw_lines[line_idx]) - text_len;
                             raw_lines[line_idx].push_str(&" ".repeat(pad));
                         }
-                        let start_x = raw_lines[line_idx].len();
+                        let start_x = char_len(&raw_lines[line_idx]);
                         raw_lines[line_idx].push_str(&bbox_text);
                         meta[line_idx][box_idx].projected_x = start_x;
                         lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before);
                     }
                     SnapKind::Center => {
                         let text_half = bbox_text.chars().count() / 2;
-                        let before = raw_lines[line_idx].len();
-                        if target_x > raw_lines[line_idx].len() + text_half {
-                            let pad = target_x - raw_lines[line_idx].len() - text_half;
+                        let before = char_len(&raw_lines[line_idx]);
+                        if target_x > char_len(&raw_lines[line_idx]) + text_half {
+                            let pad = target_x - char_len(&raw_lines[line_idx]) - text_half;
                             raw_lines[line_idx].push_str(&" ".repeat(pad));
                         }
-                        let start_x = raw_lines[line_idx].len();
+                        let start_x = char_len(&raw_lines[line_idx]);
                         raw_lines[line_idx].push_str(&bbox_text);
                         meta[line_idx][box_idx].projected_x = start_x;
                         lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before);
@@ -2256,7 +2320,7 @@ fn project_to_grid(
                     0
                 };
                 let right_bound = anchor_key(bbox_x + bbox_w);
-                let target_len = raw_lines[line_idx].len() + next_should_space;
+                let target_len = char_len(&raw_lines[line_idx]) + next_should_space;
                 update_forward_anchor_right_bound(
                     &left_snaps,
                     &mut forward_left,
@@ -2299,11 +2363,177 @@ fn project_to_grid(
                 if !raw_lines[line_idx].is_empty() && !raw_lines[line_idx].ends_with(' ') {
                     raw_lines[line_idx].push(' ');
                 }
-                let start_x = raw_lines[line_idx].len();
+                let start_x = char_len(&raw_lines[line_idx]);
                 raw_lines[line_idx].push_str(&lines[line_idx][box_idx].item.text);
                 meta[line_idx][box_idx].rendered = true;
                 meta[line_idx][box_idx].projected_x = start_x;
                 lines[line_idx][box_idx].rendered = true;
+            }
+        }
+    }
+
+    // Fixup: align rotated floating items with snapped items on adjacent lines.
+    // Rotated labels (e.g. pin names) are excluded from anchors and render at
+    // their natural x/median_width position.  If a neighboring line has snapped
+    // content at a similar PDF x but a different column, shift the rotated items
+    // to match, keeping relative spacing intact.
+    for block in &blocks {
+        for line_idx in block.start..block.end {
+            // Collect rotated floating items on this line
+            let rotated_items: Vec<usize> = (0..meta[line_idx].len())
+                .filter(|&bi| {
+                    bi < lines[line_idx].len()
+                        && lines[line_idx][bi].rotated
+                        && meta[line_idx][bi].snap.is_none()
+                })
+                .collect();
+            if rotated_items.is_empty() {
+                continue;
+            }
+
+            // Find the first rotated item's PDF x and rendered column
+            let first_bi = rotated_items[0];
+            let rot_pdf_x = lines[line_idx][first_bi].item.x;
+            let rot_col = meta[line_idx][first_bi].projected_x;
+
+            // Scan nearby lines (up to 4 away) for left/right-snapped items
+            // at a similar PDF x. Prefer non-center snaps since center-snapped
+            // items can be pulled out of position by unrelated anchor groups.
+            {
+                let scan_range = 4usize;
+                let lo = if line_idx >= block.start + scan_range {
+                    line_idx - scan_range
+                } else {
+                    block.start
+                };
+                let hi = (line_idx + scan_range + 1).min(block.end);
+
+                let mut best: Option<(f32, usize, bool)> = None; // (x_diff, col, is_center)
+                for adj in lo..hi {
+                    if adj == line_idx {
+                        continue;
+                    }
+                    for (bi, m) in meta[adj].iter().enumerate() {
+                        if bi >= lines[adj].len() || m.snap.is_none() {
+                            continue;
+                        }
+                        let is_center = m.snap == Some(SnapKind::Center);
+                        let adj_pdf_x = lines[adj][bi].item.x;
+                        let x_diff = (adj_pdf_x - rot_pdf_x).abs();
+                        if x_diff < median_width * 3.0 {
+                            let dominated = if let Some((prev_diff, _, prev_center)) = best {
+                                // Prefer non-center over center; among same type prefer closer x
+                                if !is_center && prev_center {
+                                    true
+                                } else if is_center && !prev_center {
+                                    false
+                                } else {
+                                    x_diff < prev_diff
+                                }
+                            } else {
+                                true
+                            };
+                            if dominated {
+                                best = Some((x_diff, m.projected_x, is_center));
+                            }
+                        }
+                    }
+                }
+                let best = best.map(|(d, c, _)| (d, c));
+
+                if let Some((_, adj_col)) = best
+                    && adj_col < rot_col
+                {
+                    let shift = rot_col - adj_col;
+                    // Rebuild the line: shift all rotated items left
+                    let first_col = meta[line_idx][first_bi].projected_x;
+                    let pre = &raw_lines[line_idx][..raw_lines[line_idx]
+                        .char_indices()
+                        .nth(first_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(raw_lines[line_idx].len())];
+                    let pre_trimmed = pre.trim_end();
+                    let mut new_line = pre_trimmed.to_string();
+
+                    for &bi in &rotated_items {
+                        let old_col = meta[line_idx][bi].projected_x;
+                        let new_col = old_col.saturating_sub(shift);
+                        let cur_len = char_len(&new_line);
+                        if new_col > cur_len {
+                            new_line.push_str(&" ".repeat(new_col - cur_len));
+                        }
+                        let start = char_len(&new_line);
+                        new_line.push_str(&lines[line_idx][bi].item.text);
+                        meta[line_idx][bi].projected_x = start;
+                    }
+                    raw_lines[line_idx] = new_line;
+
+                    // Also shift center-snapped items on immediately adjacent
+                    // lines whose PDF x is close to the rotated items' x range.
+                    let rot_x_min = rotated_items
+                        .iter()
+                        .map(|&bi| lines[line_idx][bi].item.x)
+                        .fold(f32::INFINITY, f32::min);
+                    let rot_x_max = rotated_items
+                        .iter()
+                        .map(|&bi| {
+                            let b = &lines[line_idx][bi].item;
+                            b.x + b.width
+                        })
+                        .fold(f32::NEG_INFINITY, f32::max);
+
+                    let immediate_adj: Vec<usize> = [
+                        line_idx.checked_sub(1).filter(|&l| l >= block.start),
+                        Some(line_idx + 1).filter(|&l| l < block.end),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+
+                    // Also shift center-snapped items on immediately adjacent
+                    // lines whose PDF x overlaps the rotated items' x range.
+                    // These items share the same spatial region but may have been
+                    // pulled out of position by center-snap constraints.
+                    let corrected_first_col = meta[line_idx][first_bi].projected_x;
+
+                    for adj in immediate_adj {
+                        for bi in 0..lines[adj].len() {
+                            if meta[adj][bi].snap != Some(SnapKind::Center) {
+                                continue;
+                            }
+                            let b = &lines[adj][bi].item;
+                            if b.x + b.width < rot_x_min - median_width * 2.0
+                                || b.x > rot_x_max + median_width * 2.0
+                            {
+                                continue;
+                            }
+                            let old_col = meta[adj][bi].projected_x;
+                            // Compute where this item should start based on
+                            // the PDF x offset from the first rotated item.
+                            let x_offset = b.x - lines[line_idx][first_bi].item.x;
+                            let col_offset = (x_offset / median_width).round().max(0.0) as usize;
+                            let target_col = corrected_first_col + col_offset;
+                            if target_col > old_col {
+                                let byte_start = raw_lines[adj]
+                                    .char_indices()
+                                    .nth(old_col)
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(raw_lines[adj].len());
+                                let pre = raw_lines[adj][..byte_start].trim_end().to_string();
+                                let post_text = &raw_lines[adj][byte_start..];
+                                let post_trimmed = post_text.trim_end();
+                                let mut rebuilt = pre;
+                                if target_col > char_len(&rebuilt) {
+                                    rebuilt.push_str(&" ".repeat(target_col - char_len(&rebuilt)));
+                                }
+                                let start = char_len(&rebuilt);
+                                rebuilt.push_str(post_trimmed);
+                                raw_lines[adj] = rebuilt;
+                                meta[adj][bi].projected_x = start;
+                            }
+                        }
+                    }
+                }
             }
         }
     }

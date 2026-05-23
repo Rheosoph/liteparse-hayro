@@ -18,7 +18,7 @@ async fn test_convert_data_to_pdf_integration() {
     let data = tokio::fs::read(fixture_path)
         .await
         .expect("Should be able to read file");
-    let (converted, _tmp_dir) = convert_data_to_pdf(data, None)
+    let (converted, _temps) = convert_data_to_pdf(data, None)
         .await
         .expect("Should be able to convert data to PDF");
     assert!(Path::new(&converted.pdf_path).exists());

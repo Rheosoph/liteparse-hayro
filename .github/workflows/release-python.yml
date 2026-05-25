@@ -53,6 +53,10 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
 
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            musl: true
+
           - os: windows-latest
             target: x86_64-pc-windows-msvc
 
@@ -71,7 +75,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.musl
         run: |
           sudo apt-get update
           sudo apt-get install -y libtesseract-dev libleptonica-dev
@@ -96,7 +100,8 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build wheels
+      - name: Build wheels (glibc)
+        if: ${{ !matrix.musl }}
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
@@ -111,6 +116,17 @@ jobs:
             elif command -v apk &> /dev/null; then
               apk add tesseract-ocr-dev leptonica-dev openssl-dev pkgconf || true
             fi
+
+      - name: Build wheels (musl)
+        if: ${{ matrix.musl }}
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          manylinux: musllinux_1_2
+          working-directory: packages/python
+          before-script-linux: |
+            apk add --no-cache tesseract-ocr-dev leptonica-dev openssl-dev pkgconf build-base cmake perl
 
       - name: Copy pdfium dylib into wheel (Unix)
         if: runner.os != 'Windows'

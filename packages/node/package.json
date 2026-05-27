@@ -1,6 +1,6 @@
 {
   "name": "@llamaindex/liteparse",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Fast, lightweight PDF and document parsing with spatial text extraction",
   "type": "module",
   "main": "./dist/lib.js",
@@ -51,10 +51,10 @@
     "typescript": "~5.9.2"
   },
   "optionalDependencies": {
-    "@llamaindex/liteparse-darwin-arm64": "2.0.0-beta.3",
-    "@llamaindex/liteparse-linux-arm64-gnu": "2.0.0-beta.3",
-    "@llamaindex/liteparse-linux-x64-gnu": "2.0.0-beta.3",
-    "@llamaindex/liteparse-win32-x64-msvc": "2.0.0-beta.3"
+    "@llamaindex/liteparse-darwin-arm64": "2.0.1",
+    "@llamaindex/liteparse-linux-arm64-gnu": "2.0.1",
+    "@llamaindex/liteparse-linux-x64-gnu": "2.0.1",
+    "@llamaindex/liteparse-win32-x64-msvc": "2.0.1"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "liteparse"
-version = "2.0.0"
+version = "2.0.1"
 description = "Python bindings for LiteParse - fast, lightweight PDF and document parsing"
 readme = "README.md"
 license = "MIT"

@@ -29,7 +29,20 @@ pub(crate) fn render_pages_for_ocr(
         let page_obj = document.page((page.page_number - 1) as i32)?;
         let has_images = !page_obj.image_bounds(25.0, 0.9).is_empty();
 
-        if text_length >= 100 && !has_images {
+        let page_area = page.page_width * page.page_height;
+        let text_bbox_area: f32 = page
+            .text_items
+            .iter()
+            .map(|item| item.width * item.height)
+            .sum();
+        let text_coverage = if page_area > 0.0 {
+            text_bbox_area / page_area
+        } else {
+            0.0
+        };
+
+        let needs_ocr = text_length < 20 || text_coverage < 0.15 || has_images;
+        if !needs_ocr {
             continue;
         }
 

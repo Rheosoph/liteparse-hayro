@@ -57,5 +57,14 @@ for needed in $(ldd "$NODE_FILE" 2>/dev/null | awk '{print $1}' | grep -E '^lib'
   cp -v "$src" "./$needed"
 done
 
+# NOTE: the prebuilt libpdfium.so from run-llama/pdfium-binaries is a glibc
+# binary. To run it on musl (Alpine), the user MUST have the gcompat package
+# installed (`apk add gcompat`). gcompat provides:
+#   - the glibc dynamic loader at /lib/ld-linux-x86-64.so.2
+#   - the FORTIFY_SOURCE wrapper symbols (__memcpy_chk, __vsnprintf_chk, ...)
+# This is a runtime requirement of the musl @llamaindex/liteparse-linux-x64-musl
+# package and is documented in the npm package README. Until the pdfium-binaries
+# fork ships a musl-native build, this is the practical path forward.
+
 echo "Bundled libs in $(pwd):"
-ls -la *.so* *.node
+ls -la *.so* *.node 2>/dev/null

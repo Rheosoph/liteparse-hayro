@@ -86,6 +86,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: lit-darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact: lit-darwin-x64
 
     runs-on: ${{ matrix.os }}
 

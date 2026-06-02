@@ -85,6 +85,7 @@ function loadNative(): NativeBindings {
     "linux-arm64-gnu": "@llamaindex/liteparse-linux-arm64-gnu",
     "linux-arm64-musl": "@llamaindex/liteparse-linux-arm64-musl",
     "win32-x64-msvc": "@llamaindex/liteparse-win32-x64-msvc",
+    "win32-arm64-msvc": "@llamaindex/liteparse-win32-arm64-msvc",
   };
 
   // Try platform-specific package first

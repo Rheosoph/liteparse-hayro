@@ -28,6 +28,11 @@ jobs:
             node-arch: darwin-arm64
             pdfium-dylib: libpdfium.dylib
 
+          - os: macos-13
+            target: x86_64-apple-darwin
+            node-arch: darwin-x64
+            pdfium-dylib: libpdfium.dylib
+
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             node-arch: linux-x64-gnu
@@ -41,6 +46,11 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             node-arch: win32-x64-msvc
+            pdfium-dylib: pdfium.dll
+
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            node-arch: win32-arm64-msvc
             pdfium-dylib: pdfium.dll
 
     runs-on: ${{ matrix.os }}
@@ -131,10 +141,14 @@ jobs:
         include:
           - os: macos-latest
             node-arch: darwin-arm64
+          - os: macos-13
+            node-arch: darwin-x64
           - os: ubuntu-latest
             node-arch: linux-x64-gnu
           - os: windows-latest
             node-arch: win32-x64-msvc
+          - os: windows-11-arm
+            node-arch: win32-arm64-msvc
     runs-on: ${{ matrix.os }}
     name: Test ${{ matrix.node-arch }}
 

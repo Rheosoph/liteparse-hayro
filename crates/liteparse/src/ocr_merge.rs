@@ -25,7 +25,16 @@ pub(crate) fn render_pages_for_ocr(
 ) -> Result<Vec<RenderedPage>, LiteParseError> {
     let mut rendered = Vec::new();
     for (idx, page) in pages.iter().enumerate() {
-        let text_length: usize = page.text_items.iter().map(|item| item.text.len()).sum();
+        // Count only non-garbled native text. Substitution-cipher-style corrupt
+        // encodings (e.g. PDFs with a broken cmap) produce long "text" that looks
+        // populated but is unreadable — without this, such pages bypass OCR
+        // because text_length >= 20 and coverage looks fine.
+        let text_length: usize = page
+            .text_items
+            .iter()
+            .filter(|item| !is_likely_garbled(&item.text))
+            .map(|item| item.text.len())
+            .sum();
         let page_obj = document.page((page.page_number - 1) as i32)?;
         let has_images = !page_obj.image_bounds(25.0, 0.9).is_empty();
 
@@ -33,6 +42,7 @@ pub(crate) fn render_pages_for_ocr(
         let text_bbox_area: f32 = page
             .text_items
             .iter()
+            .filter(|item| !is_likely_garbled(&item.text))
             .map(|item| item.width * item.height)
             .sum();
         let text_coverage = if page_area > 0.0 {
@@ -41,7 +51,8 @@ pub(crate) fn render_pages_for_ocr(
             0.0
         };
 
-        let needs_ocr = text_length < 20 || text_coverage < 0.15 || has_images;
+        let needs_ocr =
+            text_length < 20 || text_coverage < 0.15 || has_images || page_is_garbled(page);
         if !needs_ocr {
             continue;
         }
@@ -158,6 +169,24 @@ pub(crate) async fn ocr_and_merge_rendered(
         }
 
         let page = &mut pages[idx];
+        // Drop garbled native items (e.g. substitution-cipher cmap corruption) so
+        // OCR can replace them. Without this, garbled-but-spatially-present native
+        // text suppresses every OCR result that overlaps it via the overlap check
+        // below, leaving the output stuck with unreadable cipher text. We apply
+        // both per-item and per-page checks: short garbled labels ("GDWH",
+        // "XVG") can't be flagged alone, but their host page can.
+        if page_is_garbled(page) {
+            page.text_items.clear();
+        } else {
+            page.text_items
+                .retain(|item| !is_likely_garbled(&item.text));
+        }
+
+        // Only check overlap against native (already-extracted) PDF text. Comparing
+        // each OCR result against previously-accepted OCR results caused adjacent
+        // OCR lines whose bounding boxes touched within tolerance to suppress each
+        // other, dropping every second line on scanned pages.
+        let native_count = page.text_items.len();
         for r in &ocr_results {
             if r.confidence <= 0.1 {
                 continue;
@@ -168,7 +197,14 @@ pub(crate) async fn ocr_and_merge_rendered(
             let ocr_w = (r.bbox[2] - r.bbox[0]) * scale_factor;
             let ocr_h = (r.bbox[3] - r.bbox[1]) * scale_factor;
 
-            if overlaps_existing_text(&page.text_items, ocr_x, ocr_y, ocr_w, ocr_h, 2.0) {
+            if overlaps_existing_text(
+                &page.text_items[..native_count],
+                ocr_x,
+                ocr_y,
+                ocr_w,
+                ocr_h,
+                2.0,
+            ) {
                 continue;
             }
 
@@ -225,11 +261,17 @@ pub(crate) async fn ocr_and_merge_rendered(
 /// systemic-failure guard matches the same pages that were rendered because
 /// their native text was insufficient.
 fn page_has_sparse_native_text(page: &Page) -> bool {
-    let text_length: usize = page.text_items.iter().map(|item| item.text.len()).sum();
+    let text_length: usize = page
+        .text_items
+        .iter()
+        .filter(|item| !is_likely_garbled(&item.text))
+        .map(|item| item.text.len())
+        .sum();
     let page_area = page.page_width * page.page_height;
     let text_bbox_area: f32 = page
         .text_items
         .iter()
+        .filter(|item| !is_likely_garbled(&item.text))
         .map(|item| item.width * item.height)
         .sum();
     let text_coverage = if page_area > 0.0 {
@@ -239,6 +281,57 @@ fn page_has_sparse_native_text(page: &Page) -> bool {
     };
 
     text_length < 20 || text_coverage < 0.15
+}
+
+/// Heuristic for substitution-cipher / broken-cmap garbling: real Latin-script
+/// text has a vowel ratio of roughly 30–45%, but a substitution permutation
+/// almost always maps the original A/E/I/O/U onto non-vowel letters, driving
+/// the apparent vowel ratio to near zero. Texts without enough ASCII letters
+/// to judge (non-Latin scripts, numbers, short labels) are treated as fine.
+fn is_likely_garbled(text: &str) -> bool {
+    let (letters, vowels) = count_letters_and_vowels(text);
+    if letters < 10 {
+        return false;
+    }
+    vowels * 10 < letters
+}
+
+fn count_letters_and_vowels(text: &str) -> (usize, usize) {
+    let mut letters = 0usize;
+    let mut vowels = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii_alphabetic() {
+            letters += 1;
+            if matches!(ch.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u') {
+                vowels += 1;
+            }
+        }
+    }
+    (letters, vowels)
+}
+
+/// Page-level garbled check: even when individual items are too short to judge
+/// in isolation (e.g. "GDWH", "FXUUHQFB XVG"), a page whose aggregate vowel
+/// ratio collapses to single digits is almost certainly substitution-encoded.
+/// Used to drop all native items on the page before OCR merge, so short
+/// garbled labels don't suppress overlapping OCR results.
+fn page_is_garbled(page: &Page) -> bool {
+    let mut total_letters = 0usize;
+    let mut total_vowels = 0usize;
+    for it in &page.text_items {
+        let (l, v) = count_letters_and_vowels(&it.text);
+        total_letters += l;
+        total_vowels += v;
+    }
+    if total_letters < 30 {
+        return false;
+    }
+    // Real Latin-script vowel ratios sit ~30–45% across English, Portuguese,
+    // Spanish, French, etc. A page-wide ratio under 20% is well outside any
+    // natural-language range and signals substitution-style corruption. (A
+    // simple +3 Caesar shift still leaves some U/Y letters from the original
+    // O/Y mapping, so a 10% bound is too tight to catch this in practice.)
+    total_vowels * 5 < total_letters
 }
 
 /// Check if an OCR bounding box overlaps with any existing text item.

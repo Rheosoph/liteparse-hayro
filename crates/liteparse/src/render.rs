@@ -1,7 +1,9 @@
 use crate::error::LiteParseError;
-use crate::extract::load_document_from_input;
+use crate::extract::{Document, image_bounds_for_page, load_document_from_input};
 use crate::types::PdfInput;
-use image::ImageEncoder;
+use hayro::hayro_interpret::InterpreterSettings;
+use hayro::vello_cpu::color::palette::css::WHITE;
+use hayro::{RenderSettings, render};
 use serde::Serialize;
 
 /// A single rendered page as PNG bytes.
@@ -25,11 +27,11 @@ pub fn render_pages_to_png(
 }
 
 fn render_document_pages(
-    document: &pdfium::Document,
+    document: &Document,
     page_numbers: Option<&[u32]>,
     dpi: f32,
 ) -> Result<Vec<RenderedPage>, LiteParseError> {
-    let page_count = document.page_count() as u32;
+    let page_count = document.pages().len() as u32;
     let pages: Vec<u32> = match page_numbers {
         Some(nums) => nums.to_vec(),
         None => (1..=page_count).collect(),
@@ -43,12 +45,26 @@ fn render_document_pages(
             )));
         }
 
-        let page = document.page((page_num - 1) as i32)?;
-        let bitmap = page.render(dpi)?;
-        let width = bitmap.width() as u32;
-        let height = bitmap.height() as u32;
-        let rgba = bitmap.to_rgba();
-        let png_bytes = encode_png(&rgba, width, height)?;
+        let page = document
+            .pages()
+            .get((page_num - 1) as usize)
+            .ok_or_else(|| LiteParseError::Other(format!("page {page_num} out of range")))?;
+        let scale = dpi / 72.0;
+        let pixmap = render(
+            page,
+            &InterpreterSettings::default(),
+            &RenderSettings {
+                x_scale: scale,
+                y_scale: scale,
+                bg_color: WHITE,
+                ..Default::default()
+            },
+        );
+        let width = pixmap.width() as u32;
+        let height = pixmap.height() as u32;
+        let png_bytes = pixmap
+            .into_png()
+            .map_err(|e| LiteParseError::Other(format!("failed to encode PNG: {e}")))?;
 
         results.push(RenderedPage {
             page_num,
@@ -59,13 +75,6 @@ fn render_document_pages(
     }
 
     Ok(results)
-}
-
-fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, LiteParseError> {
-    let mut png_buf = Vec::new();
-    let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
-    encoder.write_image(rgba, width, height, image::ColorType::Rgba8.into())?;
-    Ok(png_buf)
 }
 
 /// Render a single page to a PNG file.
@@ -86,7 +95,7 @@ pub fn screenshot(
     std::fs::write(output_path, &page.png_bytes)?;
 
     eprintln!(
-        "[rust-bin] rendered page {} at {dpi} DPI → {output_path} ({}×{})",
+        "[rust-bin] rendered page {} at {dpi} DPI -> {output_path} ({}x{})",
         page_num, page.width, page.height
     );
 
@@ -104,7 +113,7 @@ struct ImageBoundsOutput {
 /// Extract image bounding boxes and print as JSON to stdout.
 pub fn image_bounds(pdf_path: &str, page_num: Option<u32>) -> Result<(), LiteParseError> {
     let document = load_document_from_input(&PdfInput::Path(pdf_path.to_string()), None)?;
-    let page_count = document.page_count();
+    let page_count = document.pages().len();
 
     for page_index in 0..page_count {
         if let Some(target) = page_num
@@ -113,9 +122,7 @@ pub fn image_bounds(pdf_path: &str, page_num: Option<u32>) -> Result<(), LitePar
             continue;
         }
 
-        let page = document.page(page_index)?;
-        let bounds = page.image_bounds(25.0, 0.9);
-
+        let bounds = image_bounds_for_page(&document, page_index, 25.0, 0.9)?;
         let output: Vec<ImageBoundsOutput> = bounds
             .iter()
             .map(|b| ImageBoundsOutput {

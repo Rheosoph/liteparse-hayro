@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use crate::error::LiteParseError;
+use crate::extract::{Document, image_bounds_for_page};
 use crate::ocr::{OcrEngine, OcrOptions, OcrResult};
 use crate::types::{Page, TextItem};
-use image::{ImageBuffer, Rgba};
-use pdfium::Document;
+use hayro::hayro_interpret::InterpreterSettings;
+use hayro::vello_cpu::color::palette::css::WHITE;
+use hayro::{RenderSettings, render};
 
 /// Owned page bitmap prepared for OCR. Indices refer to positions in the `pages` slice.
 pub(crate) struct RenderedPage {
@@ -16,8 +18,6 @@ pub(crate) struct RenderedPage {
 
 /// Render pages that need OCR from an already-open document.
 ///
-/// The pdfium `Document` holds raw pointers that are not `Send`, so callers must
-/// drop it before awaiting the OCR engine.
 pub(crate) fn render_pages_for_ocr(
     document: &Document,
     pages: &[Page],
@@ -35,8 +35,11 @@ pub(crate) fn render_pages_for_ocr(
             .filter(|item| !is_likely_garbled(&item.text))
             .map(|item| item.text.len())
             .sum();
-        let page_obj = document.page((page.page_number - 1) as i32)?;
-        let has_images = !page_obj.image_bounds(25.0, 0.9).is_empty();
+        let page_index = page.page_number.saturating_sub(1);
+        let page_obj = document.pages().get(page_index).ok_or_else(|| {
+            LiteParseError::Other(format!("page {} out of range", page.page_number))
+        })?;
+        let has_images = !image_bounds_for_page(document, page_index, 25.0, 0.9)?.is_empty();
 
         let page_area = page.page_width * page.page_height;
         let text_bbox_area: f32 = page
@@ -57,17 +60,23 @@ pub(crate) fn render_pages_for_ocr(
             continue;
         }
 
-        let bitmap = page_obj.render(dpi)?;
-        let width = bitmap.width() as u32;
-        let height = bitmap.height() as u32;
-        let rgba = bitmap.to_rgba();
-
-        let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(width, height, rgba)
-            .ok_or(LiteParseError::Other(
-                "failed to create image buffer".into(),
-            ))?;
-        let rgb_img = image::DynamicImage::ImageRgba8(img).to_rgb8();
-        let rgb_bytes = rgb_img.into_raw();
+        let scale = dpi / 72.0;
+        let pixmap = render(
+            page_obj,
+            &InterpreterSettings::default(),
+            &RenderSettings {
+                x_scale: scale,
+                y_scale: scale,
+                bg_color: WHITE,
+                ..Default::default()
+            },
+        );
+        let width = pixmap.width() as u32;
+        let height = pixmap.height() as u32;
+        let mut rgb_bytes = Vec::with_capacity(width as usize * height as usize * 3);
+        for px in pixmap.data_as_u8_slice().chunks_exact(4) {
+            rgb_bytes.extend_from_slice(&px[..3]);
+        }
 
         rendered.push(RenderedPage {
             idx,

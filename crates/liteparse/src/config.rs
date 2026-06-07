@@ -41,7 +41,7 @@ impl Default for LiteParseConfig {
     fn default() -> Self {
         Self {
             ocr_language: "eng".to_string(),
-            ocr_enabled: true,
+            ocr_enabled: cfg!(feature = "tesseract"),
             ocr_server_url: None,
             tessdata_path: None,
             max_pages: 1000,
@@ -126,7 +126,7 @@ mod tests {
     fn test_default_config() {
         let c = LiteParseConfig::default();
         assert_eq!(c.ocr_language, "eng");
-        assert!(c.ocr_enabled);
+        assert_eq!(c.ocr_enabled, cfg!(feature = "tesseract"));
         assert_eq!(c.max_pages, 1000);
         assert_eq!(c.dpi, 150.0);
         assert_eq!(c.output_format, OutputFormat::Json);

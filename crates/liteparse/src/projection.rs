@@ -2638,7 +2638,7 @@ fn clean_rendered_text(text: &str) -> String {
         _ => return String::new(),
     };
 
-    lines[min_y..=max_y]
+    let text = lines[min_y..=max_y]
         .iter()
         .map(|line| {
             if line.len() > min_x {
@@ -2648,7 +2648,164 @@ fn clean_rendered_text(text: &str) -> String {
             }
         })
         .collect::<Vec<_>>()
+        .join("\n");
+
+    clean_projected_text_spacing(&text)
+}
+
+fn clean_projected_text_spacing(text: &str) -> String {
+    text.lines()
+        .map(clean_projected_line_spacing)
+        .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn clean_projected_line_spacing(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut normalized = String::with_capacity(line.len());
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        let c = chars[idx];
+        if c == ' ' {
+            if let Some((next_idx, next)) = next_non_space(&chars, idx + 1) {
+                if (should_collapse_space_before_projected_punctuation(next)
+                    && has_collapsible_content_before_punctuation(&normalized))
+                    || should_collapse_projected_domain_space_after_dot(
+                        &normalized,
+                        &chars,
+                        next_idx,
+                    )
+                {
+                    idx += 1;
+                    continue;
+                }
+            }
+        }
+
+        normalized.push(c);
+        idx += 1;
+    }
+
+    normalized
+}
+
+fn next_non_space(chars: &[char], start: usize) -> Option<(usize, char)> {
+    chars
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(start)
+        .find(|(_, c)| *c != ' ')
+}
+
+fn should_collapse_space_before_projected_punctuation(c: char) -> bool {
+    matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '%')
+}
+
+fn has_collapsible_content_before_punctuation(output: &str) -> bool {
+    output
+        .chars()
+        .rev()
+        .find(|c| *c != ' ')
+        .is_some_and(|c| c.is_alphanumeric() || !c.is_ascii_punctuation())
+}
+
+fn should_collapse_projected_domain_space_after_dot(
+    output: &str,
+    chars: &[char],
+    next_idx: usize,
+) -> bool {
+    if !output.ends_with('.') || !chars[next_idx].is_ascii_alphanumeric() {
+        return false;
+    }
+
+    let next_label: String = chars[next_idx..]
+        .iter()
+        .copied()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    if next_label.is_empty() {
+        return false;
+    }
+
+    let Some(before_dot) = output.strip_suffix('.') else {
+        return false;
+    };
+    let mut token_start = before_dot
+        .rfind(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '(' | '[' | '{' | '<' | '"' | '\'' | ',' | ';' | ':' | '!' | '?' | '/'
+                )
+        })
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    if let Some(at_idx) = before_dot.rfind('@')
+        && at_idx >= token_start
+    {
+        token_start = at_idx + 1;
+    }
+    let token = &before_dot[token_start..];
+    if token.len() < 2
+        || !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '@' || c == '.')
+    {
+        return false;
+    }
+
+    token.eq_ignore_ascii_case("www")
+        || token.contains('@')
+        || is_common_tld(&next_label)
+        || label_is_followed_by_common_tld(chars, next_idx + next_label.chars().count())
+}
+
+fn label_is_followed_by_common_tld(chars: &[char], start: usize) -> bool {
+    let Some((dot_idx, '.')) = next_non_space(chars, start) else {
+        return false;
+    };
+    let Some((label_idx, first)) = next_non_space(chars, dot_idx + 1) else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+
+    let label: String = chars[label_idx..]
+        .iter()
+        .copied()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    is_common_tld(&label)
+}
+
+fn is_common_tld(label: &str) -> bool {
+    matches!(
+        label.to_ascii_lowercase().as_str(),
+        "com"
+            | "org"
+            | "net"
+            | "edu"
+            | "gov"
+            | "io"
+            | "ai"
+            | "co"
+            | "ca"
+            | "de"
+            | "uk"
+            | "us"
+            | "fr"
+            | "nl"
+            | "se"
+            | "ch"
+            | "jp"
+            | "au"
+            | "info"
+            | "dev"
+            | "app"
+    )
 }
 
 pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
@@ -2746,6 +2903,46 @@ mod tests {
         let (_, text) = project_to_grid(&page, projection_boxes);
 
         assert!(text.is_empty());
+    }
+
+    #[test]
+    fn clean_projected_text_spacing_removes_space_before_punctuation() {
+        assert_eq!(
+            clean_projected_text_spacing("The result [1] . Next"),
+            "The result [1]. Next"
+        );
+    }
+
+    #[test]
+    fn clean_projected_text_spacing_collapses_domain_spaces() {
+        assert_eq!(
+            clean_projected_text_spacing("www . dkriesel . com\nlayout-parser . github . io"),
+            "www.dkriesel.com\nlayout-parser.github.io"
+        );
+    }
+
+    #[test]
+    fn clean_projected_text_spacing_collapses_grouped_email_domain_spaces() {
+        assert_eq!(
+            clean_projected_text_spacing("{a, b}@fas . harvard . edu"),
+            "{a, b}@fas.harvard.edu"
+        );
+    }
+
+    #[test]
+    fn clean_projected_text_spacing_preserves_non_domain_sentence_space() {
+        assert_eq!(
+            clean_projected_text_spacing("save the file . also keep spacing"),
+            "save the file. also keep spacing"
+        );
+    }
+
+    #[test]
+    fn clean_projected_text_spacing_preserves_punctuation_only_artifacts() {
+        assert_eq!(
+            clean_projected_text_spacing("    :      .        2 1"),
+            "    :      .        2 1"
+        );
     }
 
     #[test]

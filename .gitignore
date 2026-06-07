@@ -78,3 +78,7 @@ docs/src/content/docs/liteparse/.api-tmp/
 packages/rust/target/
 packages/rust/vendor/
 target/
+
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md

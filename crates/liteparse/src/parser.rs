@@ -139,7 +139,7 @@ impl LiteParse {
         let t1 = web_time::Instant::now();
 
         // OCR pass
-        if self.config.ocr_enabled {
+        if self.config.ocr_enabled && !ocr_rendered.is_empty() {
             let engine: std::sync::Arc<dyn OcrEngine> = if let Some(e) =
                 self.ocr_engine_override.clone()
             {

@@ -3,7 +3,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum LiteParseError {
     #[error("PDF error: {0}")]
-    Pdf(#[from] pdfium::PdfiumError),
+    Pdf(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

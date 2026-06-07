@@ -2740,7 +2740,7 @@ fn should_collapse_projected_domain_space_after_dot(
                     '(' | '[' | '{' | '<' | '"' | '\'' | ',' | ';' | ':' | '!' | '?' | '/'
                 )
         })
-        .map(|idx| idx + 1)
+        .map(|idx| idx + before_dot[idx..].chars().next().map_or(1, |c| c.len_utf8()))
         .unwrap_or(0);
     if let Some(at_idx) = before_dot.rfind('@')
         && at_idx >= token_start

@@ -709,7 +709,7 @@ fn should_collapse_domain_space_after_dot(output: &str, chars: &[char], next_idx
         .rfind(|c: char| {
             c.is_whitespace() || matches!(c, '(' | '[' | '{' | '<' | '"' | '\'' | ',' | ';' | ':')
         })
-        .map(|idx| idx + 1)
+        .map(|idx| idx + before_dot[idx..].chars().next().map_or(1, |c| c.len_utf8()))
         .unwrap_or(0);
     let token = &before_dot[token_start..];
 

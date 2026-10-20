@@ -14,6 +14,9 @@ on:
       - "packages/node/**"
       - ".github/workflows/ci-node.yml"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -33,17 +36,17 @@ jobs:
             node-arch: darwin-x64
             pdfium-dylib: libpdfium.dylib
 
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             node-arch: linux-x64-gnu
             pdfium-dylib: libpdfium.so
 
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             node-arch: linux-arm64-gnu
             pdfium-dylib: libpdfium.so
 
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             node-arch: linux-x64-musl
             pdfium-dylib: libpdfium.so
@@ -87,7 +90,7 @@ jobs:
             ~/.cache/pdfium-rs
             ~/Library/Caches/pdfium-rs
             target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-node-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-node-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Force Ninja generator (Windows)
         if: runner.os == 'Windows'
@@ -142,7 +145,7 @@ jobs:
 
       - name: Build TypeScript
         working-directory: packages/node
-        run: npx tsc
+        run: npm run build:ts
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -167,9 +170,9 @@ jobs:
             node-arch: darwin-arm64
           - os: macos-26-intel
             node-arch: darwin-x64
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             node-arch: linux-x64-gnu
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             node-arch: linux-x64-musl
             use-container: true
           - os: windows-latest
@@ -188,7 +191,13 @@ jobs:
 
       - name: Install dependencies
         working-directory: packages/node
-        run: npm install --ignore-scripts
+        shell: bash
+        # Drop the published @llamaindex/liteparse-<platform> optional deps: the
+        # loader prefers them over a local .node, so tests would otherwise run
+        # against the last release instead of the binary built from this commit.
+        run: |
+          npm install --ignore-scripts
+          rm -rf node_modules/@llamaindex/liteparse-*
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -198,19 +207,12 @@ jobs:
 
       - name: Build TypeScript
         working-directory: packages/node
-        run: npx tsc
+        run: npm run build:ts
 
-      - name: Smoke test
+      - name: Test ESM + CJS entry points
         if: ${{ !matrix.use-container }}
         working-directory: packages/node
-        run: |
-          node -e "
-            import('./dist/lib.js').then(async ({ LiteParse }) => {
-              const p = new LiteParse({ ocrEnabled: false, quiet: true });
-              console.log('Config:', JSON.stringify(p.getConfig()));
-              console.log('Native module loaded successfully');
-            });
-          "
+        run: npm test
 
       - name: Smoke test (musl container)
         if: ${{ matrix.use-container }}

@@ -1,0 +1,131 @@
+---
+title: Markdown Output
+description: Render documents to clean, structured Markdown for LLMs and RAG pipelines.
+sidebar:
+  order: 2
+---
+
+LiteParse can render documents directly to Markdown, reconstructing headings,
+tables, lists, images, and links from the spatial layout. This is ideal for
+feeding documents to LLMs and RAG pipelines, where clean, structured text
+matters more than exact visual fidelity.
+
+Markdown is a first-class output format alongside `text` and `json`.
+
+## CLI
+
+```bash
+# Render a document to Markdown
+lit parse document.pdf --format markdown -o output.md
+
+# Print Markdown to stdout
+lit parse document.pdf --format markdown
+```
+
+### Images
+
+By default, raster images are emitted as Markdown placeholders
+(`![](image_pN_K.png)`) in reading order. Control this with `--image-mode`:
+
+| Mode | Behavior |
+|------|----------|
+| `placeholder` (default) | Emit `![](image_pN_K.png)` references in reading order |
+| `off` | Strip images entirely |
+| `embed` | Emit the same references, and extract the image bytes |
+
+`--image-mode` controls only how image *references* appear in the markdown. It does
+not, on its own, decode any pixels. To actually get image bytes, use
+`--extract-images` (see [Extraction options](/liteparse/guides/extraction/)):
+
+```bash
+# Strip images
+lit parse document.pdf --format markdown --image-mode off
+
+# Extract embedded images to disk and reference them from the markdown
+lit parse document.pdf --format markdown --extract-images --image-output-dir ./images
+```
+
+`--image-output-dir` requires `--extract-images`. For backwards compatibility
+`--image-mode embed` also turns extraction on, so the older
+`--image-mode embed --image-output-dir ./images` form still works.
+
+### Links
+
+Hyperlink annotations are rendered as `[text](url)` by default. Pass
+`--no-links` to emit the anchor text as plain text instead:
+
+```bash
+lit parse document.pdf --format markdown --no-links
+```
+
+### Headers and footers
+
+Running headers and footers (page numbers, document titles repeated on every
+page) are stripped from markdown output by default, since they interrupt the
+prose when chunked for retrieval. Pass `--keep-headers-footers` to retain them:
+
+```bash
+lit parse document.pdf --format markdown --keep-headers-footers
+```
+
+## Library
+
+The rendered Markdown is returned on `result.text`.
+
+<Tabs>
+<TabItem label="TypeScript" value="typescript">
+
+```typescript
+import { LiteParse } from "@llamaindex/liteparse";
+
+const parser = new LiteParse({
+  outputFormat: "markdown",   // "json" | "text" | "markdown"
+  imageMode: "placeholder",   // "placeholder" | "off" | "embed" (default: "placeholder")
+  extractLinks: true,         // render [text](url) link syntax (default: true)
+});
+const result = await parser.parse("document.pdf");
+console.log(result.text); // rendered Markdown
+```
+
+</TabItem>
+<TabItem label="Python" value="python">
+
+```python
+from liteparse import LiteParse
+
+parser = LiteParse(
+    output_format="markdown",   # "json" | "text" | "markdown"
+    image_mode="placeholder",   # "placeholder" | "off" | "embed"
+    extract_links=True,         # render [text](url) link syntax (default: True)
+)
+result = parser.parse("document.pdf")
+print(result.text)  # rendered Markdown
+```
+</TabItem>
+<TabItem label="Rust" value="rust">
+
+```rust
+use liteparse::config::{ImageMode, LiteParseConfig, OutputFormat};
+use liteparse::LiteParse;
+
+let config = LiteParseConfig {
+    output_format: OutputFormat::Markdown,
+    image_mode: ImageMode::Placeholder,
+    extract_links: true,
+    ..Default::default()
+};
+let result = LiteParse::new(config).parse("document.pdf").await?;
+println!("{}", result.text); // rendered Markdown
+```
+
+</TabItem>
+</Tabs>
+
+## Quality notes
+
+Markdown reconstruction quality varies with document complexity. LiteParse does
+a strong job on typical documents, handling prose, headings, simple-to-moderate tables,
+and lists. This runs entirely locally with no models using rule-based heuristics. For the hardest documents (dense or
+multi-level tables, complex multi-column layouts, charts, and scans),
+[LlamaParse](https://developers.llamaindex.ai/python/cloud/llamaparse/?utm_source=github&utm_medium=liteparse)
+remains the most accurate option.

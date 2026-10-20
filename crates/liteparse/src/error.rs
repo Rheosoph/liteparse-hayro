@@ -1,9 +1,10 @@
+use crate::pdfium_compat as pdfium;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum LiteParseError {
     #[error("PDF error: {0}")]
-    Pdf(String),
+    Pdf(#[from] pdfium::PdfiumError),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

@@ -1,0 +1,228 @@
+---
+title: Document Complexity
+description: Use is_complex to decide whether a document needs OCR or heavier parsing before you commit to it.
+sidebar:
+  order: 4
+---
+
+The `is_complex` command in LiteParse checks whether a document is "complex". This means looking for images, broken/garbled text, large amounts of vector graphics, and sparse text.
+
+Use it to:
+
+- **Route documents** to cheaper or more expensive parsing/OCR backends.
+- **Reject or flag** documents you can't handle — e.g. when running with `--no-ocr`, find the pages that would come back empty.
+- **Estimate cost** up front by counting how many pages actually need OCR.
+
+## How it works
+
+Complexity is computed **per page**. Each page gets a `needs_ocr` verdict and a list of `reasons` explaining why it was flagged. A document is "complex" if any of its pages needs OCR.
+
+The reasons are derived from a few signals:
+
+| Reason | Meaning |
+|--------|---------|
+| `scanned` | A single raster covers ~the whole page with little or no text behind it — a scanned/photographed page. |
+| `no-text` | Almost no extractable text and no full-page image — a blank page, cover, or divider. |
+| `sparse-text` | Some real text, but it covers very little of the page — typically a figure with a thin caption. |
+| `embedded-images` | Substantial embedded raster figures sit alongside the native text. |
+| `garbled` | The native text decodes to garbage and text is likely unreadable. |
+| `vector-text` | Text is painted as filled vector outlines outside the text layer, so no native text items represent it. |
+| `annotation-text` | Meaningful text lives in PDF annotations rather than the page content stream. |
+
+> The set of reasons may grow over time as the router learns to recommend heavier pipelines. Treat `reasons` as an open-ended list and route on the values you care about rather than assuming it's exhaustive.
+
+### Layout signals
+
+Alongside the OCR verdict, each page carries a nested `layout` object describing **how hard the page is to lay out** — multi-column bodies, tables, and dense figures. These are computed after spatial projection, so they see the reconstructed region tree rather than raw text items.
+
+Layout complexity is deliberately **separate from `needs_ocr`**. A crisp, fully-digital two-column paper needs no OCR at all but is layout-complex; layout reasons never make `needs_ocr` true. Route on whichever you actually care about.
+
+| Reason | Meaning |
+|--------|---------|
+| `multi-column` | The page splits into more than one text column. |
+| `table-likely` | Ruled or borderless table structure was detected on the page. |
+| `dense-graphics` | Figures cover a large fraction of the page. |
+
+| Field | Description |
+|-------|-------------|
+| `column_count` | Number of detected text columns. Always ≥ 1. |
+| `ruled_table_count` | Number of tables detected from ruling lines. |
+| `ruled_table_coverage` | Fraction of the page covered by ruled tables (0–1). |
+| `text_table_run_count` | Number of borderless, text-aligned table runs detected. |
+| `figure_count` | Number of detected figure regions. |
+| `figure_coverage` | Fraction of the page covered by figures (0–1). |
+| `is_complex` | Verdict for layout specifically. Equivalent to `reasons` being non-empty. |
+| `reasons` | Every layout reason the page was flagged with (see above). |
+
+## CLI
+
+```bash
+lit is-complex document.pdf
+```
+
+The command always prints per-page JSON to **stdout**, a human-readable verdict to **stderr**, and sets its **exit code** to reflect the result — so you can consume it however fits your workflow.
+
+```jsonc
+// stdout
+[
+  {
+    "page_number": 1,
+    "text_length": 0,
+    "text_coverage": 0.0,
+    "has_substantial_images": false,
+    "image_block_count": 0,
+    "image_coverage": 0.0,
+    "largest_image_coverage": 0.0,
+    "full_page_image": true,
+    "uncovered_vector_area": null,
+    "is_garbled": false,
+    "page_area": 482400.0,
+    "needs_ocr": true,
+    "reasons": ["scanned"],
+    "layout": {
+      "column_count": 2,
+      "ruled_table_count": 1,
+      "ruled_table_coverage": 0.18,
+      "text_table_run_count": 0,
+      "figure_count": 3,
+      "figure_coverage": 0.31,
+      "is_complex": true,
+      "reasons": ["multi-column", "table-likely", "dense-graphics"]
+    }
+  }
+]
+```
+
+```
+# stderr
+COMPLEX — 1/1 page(s) need OCR
+```
+
+The exit code is **non-zero when any page needs OCR**, so the command works as a shell predicate:
+
+```bash
+# Only parse with --no-ocr when the document is simple
+lit is-complex document.pdf --quiet && lit parse document.pdf --no-ocr
+```
+
+Pipe the JSON into `jq` to act on individual pages. The example below will list the page numbers that need OCR:
+
+```bash
+lit is-complex document.pdf --compact | jq '[.[] | select(.needs_ocr) | .page_number]'
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--compact` | Emit dense, whitespace-free JSON instead of pretty-printed. |
+| `--max-pages <N>` | Maximum number of pages to check (default: 1000). |
+| `--target-pages <SPEC>` | Check only specific pages, e.g. `"1-5,10,15-20"`. |
+| `--password <PASS>` | Password for encrypted/protected documents. |
+| `-q`, `--quiet` | Suppress the stderr logging output. |
+
+### Inline with a parse
+
+`lit is-complex` is a standalone pre-parse pass. If you're parsing the document anyway and just want the signals alongside the content, pass `--complexity` to `lit parse` instead — it adds a `complexity` object to each page of the JSON output, with the same fields described here.
+
+```bash
+lit parse document.pdf --format json --complexity
+```
+
+This is off by default: computing layout signals requires the full spatial projection, so it only runs when you ask for it.
+
+> `lit is-complex` always populates `layout`. Within `lit parse`, the `complexity` object (and its `layout`) appears only when `--complexity` is set.
+
+## Library
+
+The same check is available programmatically. It returns one entry per page.
+
+<Tabs>
+<TabItem label="TypeScript" value="typescript">
+
+```typescript
+import { LiteParse } from "@llamaindex/liteparse";
+
+const parser = new LiteParse({ ocrEnabled: false });
+const pages = await parser.isComplex("document.pdf");
+
+const complex = pages.some((p) => p.needsOcr);
+if (complex) {
+  // Route to a heavyweight pipeline, like LlamaParse
+  ...
+} else {
+  // Cheap path — skip OCR entirely
+  const result = await parser.parse("document.pdf");
+}
+
+// Inspect why specific pages were flagged
+for (const page of pages.filter((p) => p.needsOcr)) {
+  console.log(`Page ${page.pageNumber}: ${page.reasons.join(", ")}`);
+}
+```
+
+</TabItem>
+<TabItem label="Python" value="python">
+
+```python
+from liteparse import LiteParse
+
+parser = LiteParse(ocr_enabled=False)
+pages = parser.is_complex("document.pdf")
+
+if any(p.needs_ocr for p in pages):
+    # Route to a heavyweight pipeline, like LlamaParse
+    ...
+else:
+    # Cheap path — skip OCR entirely
+    result = parser.parse("document.pdf")
+
+# Inspect why specific pages were flagged
+for page in pages:
+    if page.needs_ocr:
+        print(f"Page {page.page_number}: {', '.join(page.reasons)}")
+```
+
+</TabItem>
+<TabItem label="Browser (WASM)" value="wasm">
+
+```javascript
+import { LiteParse } from "@llamaindex/liteparse-wasm";
+
+const parser = new LiteParse();
+const pages = await parser.isComplex(pdfBytes); // Uint8Array
+
+const complex = pages.some((p) => p.needsOcr);
+```
+
+</TabItem>
+</Tabs>
+
+Both the library and CLI accept raw bytes as well as file paths, so you can run the check on documents you've already loaded into memory.
+
+## Per-page fields
+
+Every entry includes the raw signals behind the verdict, so you can apply your own thresholds instead of relying solely on `needs_ocr`:
+
+| Field | Description |
+|-------|-------------|
+| `page_number` | 1-indexed page number. |
+| `needs_ocr` | Verdict: the page needs more than the cheap text-only path. Equivalent to `reasons` being non-empty. |
+| `reasons` | Every reason the page was flagged (see the table above). Empty exactly when `needs_ocr` is false. |
+| `text_length` | Length of usable native text (garbled/unmappable text excluded). |
+| `text_coverage` | Fraction of the page area covered by native text (0–1). |
+| `has_substantial_images` | Whether any counted inline raster figures are present. |
+| `image_block_count` | Number of counted raster image objects (full-page backgrounds excluded). |
+| `image_coverage` | Summed image-bbox area over page area, clamped to 1. |
+| `largest_image_coverage` | Largest single counted image's area over page area, clamped to 1. |
+| `full_page_image` | A single raster covers ≥90% of the page — the signal that tells a scan apart from a blank page. |
+| `uncovered_vector_area` | Filled vector-outline area not covered by native text (pt²). `null`/`undefined` when a cheaper signal already decided the page. |
+| `is_garbled` | Whether the native text decodes to garbage. |
+| `page_area` | Page area in pt². |
+| `layout` | Nested [layout signals](#layout-signals) for the page. Omitted when layout was not computed. |
+
+## Next steps
+
+- [OCR configuration](/liteparse/guides/ocr/): Set up the OCR backend you route complex documents to.
+- [Library usage](/liteparse/guides/library-usage/): Full programmatic API for TypeScript and Python.
+- [CLI reference](/liteparse/cli-reference/): Complete command and option reference.

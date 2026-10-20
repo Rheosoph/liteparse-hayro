@@ -109,12 +109,29 @@ source = source.replace(
 );
 
 // 3. In the return object of __wbg_get_imports, replace the env/wasi entries
-//    with our stubs objects.
-//    The generated code has duplicate "wasi_snapshot_preview1" keys and an "env" key.
-//    We replace all of them with single entries pointing to our stubs.
+//    with our stubs objects. The generated code emits a run of duplicate
+//    "wasi_snapshot_preview1": importN keys (and, depending on the pdfium build,
+//    an "env": importN key). The order and presence of these vary between
+//    wasm-bindgen versions, so collapse each independently rather than assuming
+//    a fixed env-then-wasi layout.
+const wasiBefore = source;
 source = source.replace(
-  /("env": import\d+,\n(?:\s+"wasi_snapshot_preview1": import\d+,?\n)+)/,
-  `"env": __env_stubs,\n        "wasi_snapshot_preview1": __wasi_stubs,\n`
+  /(?:[ \t]*"wasi_snapshot_preview1": import\d+,\n)+/,
+  `        "wasi_snapshot_preview1": __wasi_stubs,\n`
+);
+if (source === wasiBefore) {
+  throw new Error(
+    "patch-wasi-imports: failed to find wasi_snapshot_preview1 import entries — " +
+      "the wasm-bindgen glue layout changed, update this script."
+  );
+}
+
+// The "env" import only exists when a symbol (e.g. __c_longjmp) is left
+// unresolved at link time. When pdfium's libsetjmp.a is linked it disappears,
+// so this replacement is best-effort.
+source = source.replace(
+  /[ \t]*"env": import\d+,\n/,
+  `        "env": __env_stubs,\n`
 );
 
 writeFileSync(GLUE_PATH, source, "utf-8");

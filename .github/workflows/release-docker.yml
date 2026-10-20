@@ -12,6 +12,10 @@ on:
         type: boolean
         default: false
 
+# Default floor; jobs that publish widen this themselves.
+permissions:
+  contents: read
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME_BASE: run-llama/liteparse-base

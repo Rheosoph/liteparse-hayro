@@ -3,14 +3,13 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "outDir": "./dist",
     "rootDir": "./src",
     "strict": true,
     "esModuleInterop": true,
-    "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    // Type checking only — tsup owns emit (see tsup.config.ts). Keeping this
+    // noEmit prevents a bare `tsc` from producing an ESM-only dist/.
+    "noEmit": true
   },
   "include": ["src"],
   "exclude": ["node_modules", "dist"]

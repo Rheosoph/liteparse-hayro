@@ -10,15 +10,30 @@ export interface JsLiteParseConfig {
   ocrEnabled?: boolean
   /** HTTP OCR server URL. If set, uses HTTP OCR instead of Tesseract. */
   ocrServerUrl?: string
+  /**
+   * Extra HTTP headers sent with every request to `ocrServerUrl`
+   * (e.g. `{ Authorization: "Bearer <token>" }`).
+   */
+  ocrServerHeaders?: Record<string, string>
   /** Path to tessdata directory for Tesseract. */
   tessdataPath?: string
   /** Maximum number of pages to parse. */
   maxPages?: number
   /** Specific pages to parse (e.g., "1-5,10,15-20"). */
   targetPages?: string
+  /**
+   * Render parsed pages to PNG and return them in `ParseResult.screenshots`.
+   * Default false; PNG payloads can be large.
+   */
+  extractScreenshots?: boolean
+  /**
+   * Continue after page-level extraction failures and return them in
+   * `ParseResult.pageErrors`. Default false.
+   */
+  continueOnPageError?: boolean
   /** DPI for rendering pages (used for OCR and screenshots). */
   dpi?: number
-  /** Output format: "json" or "text". */
+  /** Output format: "json", "text", or "markdown". */
   outputFormat?: string
   /** Keep very small text that would normally be filtered out. */
   preserveVerySmallText?: boolean
@@ -26,6 +41,143 @@ export interface JsLiteParseConfig {
   password?: string
   /** Suppress progress output. */
   quiet?: boolean
+  /** Number of concurrent OCR workers (default: CPU cores - 1). */
+  numWorkers?: number
+  /**
+   * How to surface raster images in markdown output: "off", "placeholder"
+   * (default; emits `![](img_pN_K.png)` references with no bytes), or
+   * "embed" (same presentation as placeholder; extraction is independent).
+   */
+  imageMode?: string
+  /** Extract embedded image bytes and metadata (default false). */
+  extractImages?: boolean
+  /**
+   * Directory where embedded image files are written. Requires
+   * `extractImages` to be true.
+   */
+  imageOutputDir?: string
+  /**
+   * Render hyperlink annotations as `[text](url)` in markdown output
+   * (default true). Set false for plain anchor text.
+   */
+  extractLinks?: boolean
+  /**
+   * Keep running headers/footers in markdown output instead of stripping
+   * repeated page-band lines and page chrome (default false).
+   */
+  keepHeadersFooters?: boolean
+  /** Extract all PDF annotations as page-scoped structured data. */
+  extractAnnotations?: boolean
+  /**
+   * Emit each page's classified layout blocks (headings, paragraphs, list
+   * items, tables with per-cell boxes, code, rules, figures) with bounding
+   * boxes as `ParsedPage.blocks`. Default false.
+   */
+  extractBlocks?: boolean
+  /** Extract AcroForm widget fields and values. */
+  extractFormFields?: boolean
+  /** Extract the tagged-PDF logical structure tree. */
+  extractStructureTree?: boolean
+  /**
+   * Extract raw XFA packets (name + XML content) into
+   * `ParseResult.xfaPackets`. Default false.
+   */
+  extractXfaPackets?: boolean
+  /**
+   * Collect document provenance metadata into `ParseResult.docMeta`.
+   * Default false: it streams the whole source file once. Absent for
+   * inputs converted from a non-PDF format.
+   */
+  extractDocumentMetadata?: boolean
+  /**
+   * Emit each page's `contentBounds` (union bbox of top-level content
+   * objects, viewport coords). Default false.
+   */
+  extractContentBounds?: boolean
+  /**
+   * Detect solid rectangles/lines in rendered page screenshots and attach
+   * them to each screenshot result. Default false.
+   */
+  detectScreenshotRects?: boolean
+  /**
+   * Draw AcroForm field appearances into rendered rasters (screenshots and
+   * OCR inputs). Runs the document's open/JS actions. Default false.
+   */
+  renderFormFields?: boolean
+  /**
+   * Whether a systemic OCR failure aborts the whole parse (default true).
+   * Set false to keep already-recovered native text and return partial
+   * results when OCR is unavailable, instead of rejecting.
+   */
+  ocrFailureFatal?: boolean
+  /**
+   * OCR request-hedging schedule (ms). Empty/unset = no hedging. Multiple
+   * delays (e.g. `[0, 5000, 10000]`) fire duplicate requests per attempt and
+   * take the first success — lower tail latency at the cost of extra load.
+   */
+  ocrHedgeDelaysMs?: Array<number>
+  /**
+   * Emit per-word sub-boxes on each text item (`TextItem.words`). Default
+   * false. Word boxes roughly double the text-item payload, so enable only
+   * for word-level bbox attribution.
+   */
+  emitWordBoxes?: boolean
+  /** Include rich PDF text metadata on returned text items. Default false. */
+  extractTextMetadata?: boolean
+  /**
+   * Restrict output to a page sub-region. Each field is the fraction of the
+   * page cropped from that side; a text item survives only if it lies
+   * entirely inside the remaining rectangle. Unset keeps the whole page.
+   */
+  cropBox?: JsCropBox
+  /**
+   * Drop diagonal text (rotation >2° off the nearest right angle). Default
+   * false. Use to exclude rotated watermarks/stamps from the output.
+   */
+  skipDiagonalText?: boolean
+  /**
+   * Per-page orientation corrections from an upstream orientation
+   * classifier. Each entry names a 1-based page and the clockwise angle
+   * (0/90/180/270) by which its content appears rotated; LiteParse
+   * counter-rotates that page before extraction so text, reading order,
+   * page size and OCR rasters come out upright. Applied on top of the PDF's
+   * own /Rotate. Unlisted or out-of-range pages are left unchanged.
+   */
+  pageOrientationCorrections?: Array<JsPageOrientationCorrection>
+  /**
+   * Compute per-page complexity signals during parse and attach them to each
+   * page as `ParsedPage.complexity` (the same signals `isComplex` returns).
+   * Default false; enabling it runs an extra vector-text detection pass.
+   */
+  includeComplexity?: boolean
+  /** Expose page-scoped vector path extraction. Default false. */
+  extractVectorGraphics?: boolean
+}
+/**
+ * One page's orientation correction: `page` is 1-based, `angle` is the
+ * clockwise degrees (0/90/180/270) the content appears rotated.
+ */
+export interface JsPageOrientationCorrection {
+  page: number
+  angle: number
+}
+/**
+ * A page sub-region as the fraction cropped from each side (top-left origin,
+ * each in `[0, 1]`).
+ */
+export interface JsCropBox {
+  top: number
+  right: number
+  bottom: number
+  left: number
+}
+/** One word's sub-box within a `JsTextItem`, in the same viewport space. */
+export interface JsWordBox {
+  text: string
+  x: number
+  y: number
+  width: number
+  height: number
 }
 export interface JsTextItem {
   text: string
@@ -35,25 +187,401 @@ export interface JsTextItem {
   height: number
   fontName?: string
   fontSize?: number
+  fontHeight?: number
+  fontAscent?: number
+  fontDescent?: number
+  fontWeight?: number
+  textWidth?: number
+  fontIsBuggy?: boolean
+  mcid?: number
+  /** Fill color as an eight-character ARGB hex string. */
+  fillColor?: string
+  /** Stroke color as an eight-character ARGB hex string. */
+  strokeColor?: string
+  /** Raw PDF content-stream character codes for the source glyphs. */
+  charCodes?: Array<number>
+  /** True when the trailing source space was synthesized by PDFium. */
+  trailingSpaceGenerated?: boolean
+  /** OCR confidence score (0.0-1.0). Undefined for native PDF text. */
   confidence?: number
+  /** Rotation in degrees (viewport space). Defaults to 0 when omitted. */
+  rotation?: number
+  /**
+   * Per-word sub-boxes for attribution. Empty for items with no word split
+   * (e.g. OCR-sourced or single-token items).
+   */
+  words: Array<JsWordBox>
+}
+/**
+ * A vector-graphic primitive supplied by an external extractor. `kind` selects
+ * the variant: `"stroke"` (uses `x1/y1/x2/y2`) or `"rect"` (uses
+ * `x/y/width/height`). Coordinates are viewport space (top-left origin, 72
+ * DPI), matching the text items. `has_fill`/`has_stroke` carry the paint
+ * intent even when no color is known, so ruled-table edge detection still
+ * treats a colorless stroked rect as stroked.
+ */
+export interface JsGraphic {
+  /** "stroke" or "rect". Anything else is dropped. */
+  kind: string
+  x1?: number
+  y1?: number
+  x2?: number
+  y2?: number
+  x?: number
+  y?: number
+  width?: number
+  height?: number
+  /** Whether the path is filled. Drives Rect `fill` presence. */
+  hasFill?: boolean
+  /** Whether the path is stroked. Drives Rect `stroke` presence. */
+  hasStroke?: boolean
+  /** Fill color as ARGB hex (e.g. "ff000000"). May be absent even when filled. */
+  fillColor?: string
+  /** Stroke color as ARGB hex. May be absent even when stroked. */
+  strokeColor?: string
+  /** Stroke line width in points. */
+  lineWidth?: number
+}
+/**
+ * A page of pre-extracted text supplied by an external extractor. Coordinates
+ * are viewport space (top-left origin, 72 DPI). `graphics` enables ruled-table
+ * and horizontal-rule detection; struct nodes are still unsupported on this
+ * path, so tagged-heading detection remains unavailable until they are added.
+ */
+export interface JsPageInput {
+  pageNumber: number
+  pageWidth: number
+  pageHeight: number
+  textItems: Array<JsTextItem>
+  graphics?: Array<JsGraphic>
 }
 export interface JsParsedPage {
   pageNum: number
+  /**
+   * The document's `/PageLabels` label for this page ("iv", "A-1"), absent
+   * when the PDF defines none. This is what a reader displays for the page
+   * and is not always its position; fall back to `page_num` when absent.
+   */
+  pageLabel?: string
   width: number
   height: number
+  /**
+   * Union bbox of the page's top-level content objects in viewport
+   * coords (visible content extent). Absent for empty pages.
+   */
+  contentBounds?: JsRect
   text: string
+  markdown: string
   textItems: Array<JsTextItem>
+  complexity?: JsPageComplexityStats
+  vectorGraphics?: JsVectorGraphics
+  annotations?: Array<JsDocumentAnnotation>
+  /**
+   * Classified layout blocks in reading order; present only when
+   * `extractBlocks` is enabled.
+   */
+  blocks?: Array<JsLayoutBlock>
+  formFields?: Array<JsFormField>
+  structureTree?: JsStructureTree
+}
+export interface JsStructureAttribute {
+  name: string
+  booleanValue?: boolean
+  numberValue?: number
+  stringValue?: string
+}
+export interface JsStructureTree {
+  roots: Array<JsStructureTreeElement>
+}
+export interface JsStructureTreeElement {
+  elementType: string
+  id?: string
+  actualText?: string
+  altText?: string
+  title?: string
+  attributes: Array<JsStructureAttribute>
+  markedContentIds: Array<number>
+  children: Array<JsStructureTreeElement>
+  annotations: Array<JsDocumentAnnotation>
+}
+export interface JsVectorShape {
+  bbox: JsRect
+  stroke: boolean
+  strokeColor?: string
+  fill: boolean
+  fillColor?: string
+  hasCurve: boolean
+}
+export interface JsRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+export interface JsAnnotationRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+export interface JsVectorLine {
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+  stroke: boolean
+  strokeWidth?: number
+  strokeColor?: string
+  fill: boolean
+  fillColor?: string
+}
+export interface JsVectorGraphics {
+  shapes: Array<JsVectorShape>
+  lines: Array<JsVectorLine>
+}
+export interface JsDocumentAnnotation {
+  subtype: string
+  contents?: string
+  created?: string
+  modified?: string
+  title?: string
+  rect?: JsAnnotationRect
+  quadpointRects: Array<JsAnnotationRect>
+  uri?: string
+}
+export interface JsFormField {
+  id: string
+  fieldType: string
+  page: number
+  annotationIndex: number
+  widgetIndex: number
+  objectNumber?: number
+  name?: string
+  alternateName?: string
+  value?: string
+  exportValue?: string
+  fieldFlags: number
+  controlCount?: number
+  controlIndex?: number
+  checked?: boolean
+  rect?: JsAnnotationRect
+  options: Array<string>
+  selectedOptions: Array<string>
+}
+/**
+ * One table cell: its rendered text and the region it occupied. `bbox` is
+ * absent for cells with no ink behind them (padding for a ragged grid, or a
+ * merged run split at an estimated boundary).
+ */
+export interface JsLayoutCell {
+  text: string
+  bbox?: JsAnnotationRect
+}
+/**
+ * A classified block plus where it sits on the page. Flat by design — `kind`
+ * discriminates the block and every field that doesn't apply to that kind is
+ * absent.
+ */
+export interface JsLayoutBlock {
+  /**
+   * One of `heading`, `paragraph`, `list_item`, `code`, `table`,
+   * `grid_fallback`, `rule`, `figure`.
+   */
+  kind: string
+  /**
+   * Rendered text for the text-bearing kinds (`heading`, `paragraph`,
+   * `list_item`). Table text lives in `header`/`rows`; code and grid text in
+   * `lines`.
+   */
+  text?: string
+  /** Heading level (1–6), or list nesting depth for `list_item`. */
+  level?: number
+  /**
+   * Whether the block's text is uniformly bold / italic. `paragraph` and
+   * `list_item` only; false otherwise.
+   */
+  bold: boolean
+  italic: boolean
+  /**
+   * `list_item`: whether the list is ordered, and the original marker as it
+   * appeared on the page (`138.`, `iii)`, `•`).
+   */
+  ordered?: boolean
+  marker?: string
+  /** Verbatim source lines for `code` and `grid_fallback`. */
+  lines?: Array<string>
+  /** Best-effort language hint for `code`. */
+  lang?: string
+  /** `table`: the header row, when one was detected. */
+  header?: Array<JsLayoutCell>
+  /** `table`: the body rows. */
+  rows?: Array<Array<JsLayoutCell>>
+  /**
+   * `figure`: the image's page-scoped id and encoded format, matching the
+   * `img_{id}.{format}` target the markdown renderer emits.
+   */
+  id?: string
+  format?: string
+  /**
+   * Region of the page this block occupies, in the same viewport space as
+   * `textItems`. Absent when the block has no page geometry behind it.
+   */
+  bbox?: JsAnnotationRect
 }
 export interface JsParseResult {
+  /** Total source-document pages before target/max-page filtering. */
+  totalPages: number
   pages: Array<JsParsedPage>
+  pageErrors: Array<JsPageError>
   text: string
+  images: Array<JsExtractedImage>
+  screenshots: Array<JsScreenshotResult>
+  imageErrorCount: number
+  formType?: number
+  /** The document's `/Info` `Creator` entry, when present. */
+  creator?: string
+  /** The document's `/Info` `Producer` entry, when present. */
+  producer?: string
+  /**
+   * Document-level provenance metadata; present only when
+   * `extractDocumentMetadata` is enabled and the input was a real PDF.
+   */
+  docMeta?: JsDocumentMetadata
+  /** Raw XFA packets; present only when `extractXfaPackets` is enabled. */
+  xfaPackets?: Array<JsXfaPacket>
+}
+/** One batch of pages from a `ParseSession`. */
+export interface JsParseBatch {
+  /** First source page in this batch, 1-indexed. */
+  startPage: number
+  /** Last source page in this batch, 1-indexed and inclusive. */
+  endPage: number
+  /** The pages in `startPage..=endPage`, as an ordinary parse result. */
+  result: JsParseResult
+}
+export interface JsPageError {
+  pageNum: number
+  message: string
+}
+export interface JsDocumentMetadata {
+  creationDate?: string
+  modDate?: string
+  fileVersion?: number
+  isEncrypted?: boolean
+  securityHandlerRevision?: number
+  permissions?: number
+  eofSectionCount?: number
+  startxrefCount?: number
+  trailerIdPairDiffers?: boolean
+  rawFileSize?: number
+  xmp?: string
+  /** True when the catalog's XMP stream exceeded the 64 KiB cap. */
+  xmpTruncated?: boolean
+  signatureCount?: number
+  signatureByteRangeReachesEof?: boolean
+}
+/** One raw packet from an XFA form document's `/XFA` array. */
+export interface JsXfaPacket {
+  index: number
+  name?: string
+  contentLength: number
+  /** Packet content (usually XML), lossily decoded as UTF-8. */
+  content?: string
+}
+export interface JsImageRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+export interface JsExtractedImage {
+  id: string
+  name: string
+  path?: string
+  page: number
+  bbox: JsImageRect
+  width: number
+  height: number
+  rotation: number
+  format: string
+  duplicateOf?: string
+  bytes: Buffer
 }
 export interface JsScreenshotResult {
   pageNum: number
   width: number
   height: number
   imageBuffer: Buffer
+  /** True when every pixel has the same color (blank page after render). */
+  isSolidFill: boolean
+  /**
+   * Solid rectangles/lines detected in the raster (viewport coords).
+   * Populated only when `detectScreenshotRects` is enabled.
+   */
+  rects: Array<JsScreenshotRect>
 }
+/**
+ * One solid rectangle (or line) detected in a rendered page bitmap, in
+ * viewport coords (top-left origin, 72 DPI).
+ */
+export interface JsScreenshotRect {
+  x: number
+  y: number
+  width: number
+  height: number
+  /** Fill color as ARGB hex string (e.g. "ff1a2b3c"). */
+  color: string
+  /** True when the region is a solid line rather than a filled area. */
+  isLine: boolean
+}
+export interface JsLayoutComplexityStats {
+  columnCount: number
+  ruledTableCount: number
+  ruledTableCoverage: number
+  textTableRunCount: number
+  figureCount: number
+  figureCoverage: number
+  isComplex: boolean
+  reasons: Array<string>
+}
+export interface JsPageComplexityStats {
+  pageNumber: number
+  textLength: number
+  textCoverage: number
+  hasSubstantialImages: boolean
+  /**
+   * Number of counted raster images — inline figures only; full-page
+   * backgrounds are excluded (see `fullPageImage`).
+   */
+  imageBlockCount: number
+  /**
+   * Summed image-bbox area over page area, clamped to 1. Counts inline
+   * figures only: a full-page scan raster contributes 0 here — check
+   * `fullPageImage` for that.
+   */
+  imageCoverage: number
+  /**
+   * Largest single counted image's area over page area, clamped to 1. Same
+   * exclusion as `imageCoverage`: a full-page raster contributes 0.
+   */
+  largestImageCoverage: number
+  /**
+   * A single raster covering ≥90% of the page is present. Such full-page
+   * backgrounds are excluded from `imageCoverage`/`largestImageCoverage`
+   * (they're not inline figures), so this flag is the only signal that
+   * distinguishes a scan from a genuinely blank page — both otherwise
+   * report no text and no counted images.
+   */
+  fullPageImage: boolean
+  uncoveredVectorArea?: number
+  isGarbled: boolean
+  pageArea: number
+  needsOcr: boolean
+  reasons: Array<string>
+  layout?: JsLayoutComplexityStats
+}
+/** Search text items for phrase matches, returning merged items with combined bounding boxes. */
+export declare function searchItems(items: Array<JsTextItem>, phrase: string, caseSensitive?: boolean | undefined | null): Array<JsTextItem>
 /** Main LiteParse parser class. */
 export declare class LiteParse {
   /**
@@ -63,8 +591,66 @@ export declare class LiteParse {
   constructor(config?: JsLiteParseConfig | undefined | null)
   /** Parse a document. Accepts a file path (string) or raw PDF bytes (Buffer). */
   parse(input: string | Buffer): Promise<JsParseResult>
-  /** Take screenshots of document pages. Returns PNG image buffers. */
+  /**
+   * Open a document for bounded-memory batch parsing. Internal plumbing
+   * for the JS wrapper's `parseBatches()` — prefer that; it also closes
+   * the session for you.
+   *
+   * Converts a non-PDF source once, then yields `batchSize` pages at a time
+   * via `nextBatch()` (default 25). Cross-page passes (repeated
+   * header/footer removal, image deduplication) see only the pages in their
+   * own batch, so output can differ from a whole-document `parse()`.
+   */
+  openBatchSession(input: string | Buffer, batchSize?: number | undefined | null): Promise<ParseSession>
+  /**
+   * Parse from pre-extracted pages, skipping PDFium text extraction.
+   *
+   * The caller supplies pages already populated with text items in viewport
+   * space (top-left origin, 72 DPI). Runs only grid projection + the
+   * configured output formatter, so it never loads PDFium. Use when an
+   * external extractor owns text extraction (e.g. to keep its own
+   * font-recovery pipeline).
+   */
+  parsePages(pages: Array<JsPageInput>): JsParseResult
+  /**
+   * Determine per-page complexity. Returns one entry per parsed page with
+   * signals (text coverage, images, garbled text, vector area) and a
+   * `needsOcr` verdict — a cheap pre-OCR check to decide whether a document
+   * needs advanced parsing. Accepts a file path (string) or raw PDF bytes.
+   */
+  isComplex(input: string | Buffer): Promise<Array<JsPageComplexityStats>>
+  /**
+   * Take screenshots of document pages. Returns PNG image buffers.
+   *
+   * Non-PDF files are automatically converted to PDF before rendering when
+   * LibreOffice/ImageMagick are available.
+   */
   screenshot(input: string | Buffer, pageNumbers?: Array<number> | undefined | null): Promise<Array<JsScreenshotResult>>
   /** Get the current configuration. */
   get config(): JsLiteParseConfig
+}
+/**
+ * A document opened once and parsed in bounded page batches. Internal
+ * plumbing for the JS wrapper's `parseBatches()` — prefer that.
+ *
+ * Created by `LiteParse.openBatchSession()`. The converted-PDF temporary
+ * file for a non-PDF source lives as long as the session, so conversion is
+ * paid once no matter how many batches are consumed. Call `close()` when
+ * abandoning the session early — otherwise that temp file waits for GC.
+ */
+export declare class ParseSession {
+  /** Total pages in the source document, before `maxPages` or batching. */
+  get totalPages(): number
+  /**
+   * Parse and return the next batch, or `null` once every page within
+   * `maxPages` has been yielded. Rejects if the session is closed.
+   */
+  nextBatch(): Promise<JsParseBatch | null>
+  /**
+   * Release the session's resources now — most importantly the converted
+   * temporary PDF for a non-PDF source, which otherwise lives until the
+   * JS object is garbage collected. Idempotent; `nextBatch()` rejects
+   * afterwards.
+   */
+  close(): Promise<void>
 }

@@ -23,6 +23,17 @@ macro_rules! load_fn {
     }};
 }
 
+/// Like `load_fn!`, but yields `None` instead of failing the whole load when
+/// the symbol is missing. For APIs a trimmed pdfium build may omit — callers
+/// must degrade gracefully rather than assume the function exists.
+macro_rules! load_fn_opt {
+    ($lib:expr, $name:literal) => {{
+        unsafe { $lib.get::<*const ()>($name.as_bytes()) }
+            .ok()
+            .map(|sym| unsafe { std::mem::transmute(*sym) })
+    }};
+}
+
 /// Holds all pdfium function pointers loaded at runtime.
 pub struct PdfiumBindings {
     // Keep the library handle alive — dropping it would unload the symbols.
@@ -41,6 +52,72 @@ pub struct PdfiumBindings {
     ) -> FPDF_DOCUMENT,
     pub FPDF_CloseDocument: unsafe extern "C" fn(FPDF_DOCUMENT),
     pub FPDF_GetPageCount: unsafe extern "C" fn(FPDF_DOCUMENT) -> std::os::raw::c_int,
+    pub FPDF_GetFormType: unsafe extern "C" fn(FPDF_DOCUMENT) -> std::os::raw::c_int,
+    pub FPDFCatalog_IsTagged: unsafe extern "C" fn(FPDF_DOCUMENT) -> FPDF_BOOL,
+    pub FPDFDOC_InitFormFillEnvironment:
+        unsafe extern "C" fn(FPDF_DOCUMENT, *mut FPDF_FORMFILLINFO) -> FPDF_FORMHANDLE,
+    pub FPDFDOC_ExitFormFillEnvironment: unsafe extern "C" fn(FPDF_FORMHANDLE),
+    pub FORM_OnAfterLoadPage: unsafe extern "C" fn(FPDF_PAGE, FPDF_FORMHANDLE),
+    pub FORM_OnBeforeClosePage: unsafe extern "C" fn(FPDF_PAGE, FPDF_FORMHANDLE),
+    pub FORM_DoDocumentJSAction: unsafe extern "C" fn(FPDF_FORMHANDLE),
+    pub FORM_DoDocumentOpenAction: unsafe extern "C" fn(FPDF_FORMHANDLE),
+    pub FORM_DoPageAAction: unsafe extern "C" fn(FPDF_PAGE, FPDF_FORMHANDLE, std::os::raw::c_int),
+    pub FPDF_FFLDraw: unsafe extern "C" fn(
+        FPDF_FORMHANDLE,
+        FPDF_BITMAP,
+        FPDF_PAGE,
+        std::os::raw::c_int,
+        std::os::raw::c_int,
+        std::os::raw::c_int,
+        std::os::raw::c_int,
+        std::os::raw::c_int,
+        std::os::raw::c_int,
+    ),
+    pub FPDF_GetMetaText: unsafe extern "C" fn(
+        FPDF_DOCUMENT,
+        FPDF_BYTESTRING,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDF_GetPageLabel: unsafe extern "C" fn(
+        FPDF_DOCUMENT,
+        std::os::raw::c_int,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDF_GetFileVersion:
+        unsafe extern "C" fn(FPDF_DOCUMENT, *mut std::os::raw::c_int) -> FPDF_BOOL,
+    pub FPDF_GetSecurityHandlerRevision: unsafe extern "C" fn(FPDF_DOCUMENT) -> std::os::raw::c_int,
+    pub FPDF_GetDocPermissions: unsafe extern "C" fn(FPDF_DOCUMENT) -> std::os::raw::c_ulong,
+    // `fpdf_signature` is absent from some trimmed pdfium builds, so these
+    // three load optionally and callers fall back to "no signature info".
+    pub FPDF_GetSignatureCount: Option<unsafe extern "C" fn(FPDF_DOCUMENT) -> std::os::raw::c_int>,
+    pub FPDF_GetSignatureObject:
+        Option<unsafe extern "C" fn(FPDF_DOCUMENT, std::os::raw::c_int) -> FPDF_SIGNATURE>,
+    pub FPDFSignatureObj_GetByteRange: Option<
+        unsafe extern "C" fn(
+            FPDF_SIGNATURE,
+            *mut std::os::raw::c_int,
+            std::os::raw::c_ulong,
+        ) -> std::os::raw::c_ulong,
+    >,
+    pub FPDF_GetXFAPacketCount: unsafe extern "C" fn(FPDF_DOCUMENT) -> std::os::raw::c_int,
+    pub FPDF_GetXFAPacketName: unsafe extern "C" fn(
+        FPDF_DOCUMENT,
+        std::os::raw::c_int,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDF_GetXFAPacketContent: unsafe extern "C" fn(
+        FPDF_DOCUMENT,
+        std::os::raw::c_int,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+        *mut std::os::raw::c_ulong,
+    ) -> FPDF_BOOL,
+
+    pub FPDF_GetPageSizeByIndexF:
+        unsafe extern "C" fn(FPDF_DOCUMENT, std::os::raw::c_int, *mut FS_SIZEF) -> FPDF_BOOL,
 
     // -- Page --
     pub FPDF_LoadPage: unsafe extern "C" fn(FPDF_DOCUMENT, std::os::raw::c_int) -> FPDF_PAGE,
@@ -49,6 +126,31 @@ pub struct PdfiumBindings {
     pub FPDF_GetPageHeightF: unsafe extern "C" fn(FPDF_PAGE) -> f32,
     pub FPDF_GetPageBoundingBox: unsafe extern "C" fn(FPDF_PAGE, *mut FS_RECTF) -> FPDF_BOOL,
     pub FPDFPage_GetRotation: unsafe extern "C" fn(FPDF_PAGE) -> std::os::raw::c_int,
+    pub FPDFPage_SetRotation: unsafe extern "C" fn(FPDF_PAGE, std::os::raw::c_int),
+    pub FPDFPage_SetCropBox: unsafe extern "C" fn(FPDF_PAGE, f32, f32, f32, f32),
+    /// LlamaParse fork API (absent from stock pdfium and older fork
+    /// releases); callers fall back to the raw-byte `/UserUnit` scan.
+    pub FPDFPage_GetUserUnit: Option<unsafe extern "C" fn(FPDF_PAGE) -> f32>,
+    pub FPDFPage_Flatten:
+        Option<unsafe extern "C" fn(FPDF_PAGE, std::os::raw::c_int) -> std::os::raw::c_int>,
+    /// `fpdf_edit.h` / `fpdf_ppo.h` page-editing entry points, used to build a
+    /// disposable single-page copy for widget-appearance text (see
+    /// `Document::widget_appearance_copy`). Optional like `FPDFPage_Flatten`: a
+    /// trimmed build without them loses widget text, not the parse.
+    pub FPDF_CreateNewDocument: Option<unsafe extern "C" fn() -> FPDF_DOCUMENT>,
+    pub FPDF_ImportPagesByIndex: Option<
+        unsafe extern "C" fn(
+            FPDF_DOCUMENT,
+            FPDF_DOCUMENT,
+            *const std::os::raw::c_int,
+            std::os::raw::c_ulong,
+            std::os::raw::c_int,
+        ) -> FPDF_BOOL,
+    >,
+    pub FPDFPage_RemoveObject:
+        Option<unsafe extern "C" fn(FPDF_PAGE, FPDF_PAGEOBJECT) -> FPDF_BOOL>,
+    pub FPDFPageObj_Destroy: Option<unsafe extern "C" fn(FPDF_PAGEOBJECT)>,
+    pub FPDFPage_GenerateContent: Option<unsafe extern "C" fn(FPDF_PAGE) -> FPDF_BOOL>,
     pub FPDF_PageToDevice: unsafe extern "C" fn(
         FPDF_PAGE,
         std::os::raw::c_int,
@@ -72,6 +174,74 @@ pub struct PdfiumBindings {
         unsafe extern "C" fn(FPDF_PAGEOBJECT) -> std::os::raw::c_int,
     pub FPDFImageObj_GetRenderedBitmap:
         unsafe extern "C" fn(FPDF_DOCUMENT, FPDF_PAGE, FPDF_PAGEOBJECT) -> FPDF_BITMAP,
+    pub FPDFImageObj_GetBitmap: unsafe extern "C" fn(FPDF_PAGEOBJECT) -> FPDF_BITMAP,
+    pub FPDFImageObj_GetImageDataDecoded: unsafe extern "C" fn(
+        FPDF_PAGEOBJECT,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFImageObj_GetImageDataRaw: unsafe extern "C" fn(
+        FPDF_PAGEOBJECT,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFImageObj_GetImageFilterCount:
+        unsafe extern "C" fn(FPDF_PAGEOBJECT) -> std::os::raw::c_int,
+    pub FPDFImageObj_GetImageFilter: unsafe extern "C" fn(
+        FPDF_PAGEOBJECT,
+        std::os::raw::c_int,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFImageObj_GetImageMetadata:
+        unsafe extern "C" fn(FPDF_PAGEOBJECT, FPDF_PAGE, *mut FPDF_IMAGEOBJ_METADATA) -> FPDF_BOOL,
+    pub FPDFImageObj_GetImagePixelSize: unsafe extern "C" fn(
+        FPDF_PAGEOBJECT,
+        *mut std::os::raw::c_uint,
+        *mut std::os::raw::c_uint,
+    ) -> FPDF_BOOL,
+    pub FPDFPageObj_GetClipPath: Option<unsafe extern "C" fn(FPDF_PAGEOBJECT) -> FPDF_CLIPPATH>,
+    pub FPDFClipPath_CountPaths: Option<unsafe extern "C" fn(FPDF_CLIPPATH) -> std::os::raw::c_int>,
+    pub FPDFClipPath_CountPathSegments:
+        Option<unsafe extern "C" fn(FPDF_CLIPPATH, std::os::raw::c_int) -> std::os::raw::c_int>,
+    pub FPDFClipPath_GetPathSegment: Option<
+        unsafe extern "C" fn(
+            FPDF_CLIPPATH,
+            std::os::raw::c_int,
+            std::os::raw::c_int,
+        ) -> FPDF_PATHSEGMENT,
+    >,
+    pub FPDFPageObj_GetMatrix: unsafe extern "C" fn(FPDF_PAGEOBJECT, *mut FS_MATRIX) -> FPDF_BOOL,
+    pub FPDFPageObj_GetStrokeColor: unsafe extern "C" fn(
+        FPDF_PAGEOBJECT,
+        *mut std::os::raw::c_uint,
+        *mut std::os::raw::c_uint,
+        *mut std::os::raw::c_uint,
+        *mut std::os::raw::c_uint,
+    ) -> FPDF_BOOL,
+    pub FPDFPageObj_GetFillColor: unsafe extern "C" fn(
+        FPDF_PAGEOBJECT,
+        *mut std::os::raw::c_uint,
+        *mut std::os::raw::c_uint,
+        *mut std::os::raw::c_uint,
+        *mut std::os::raw::c_uint,
+    ) -> FPDF_BOOL,
+    pub FPDFPageObj_GetStrokeWidth: unsafe extern "C" fn(FPDF_PAGEOBJECT, *mut f32) -> FPDF_BOOL,
+    pub FPDFPath_GetDrawMode: unsafe extern "C" fn(
+        FPDF_PAGEOBJECT,
+        *mut std::os::raw::c_int,
+        *mut FPDF_BOOL,
+    ) -> FPDF_BOOL,
+    pub FPDFFormObj_CountObjects: unsafe extern "C" fn(FPDF_PAGEOBJECT) -> std::os::raw::c_int,
+    pub FPDFFormObj_GetObject:
+        unsafe extern "C" fn(FPDF_PAGEOBJECT, std::os::raw::c_ulong) -> FPDF_PAGEOBJECT,
+    pub FPDFPath_CountSegments: unsafe extern "C" fn(FPDF_PAGEOBJECT) -> std::os::raw::c_int,
+    pub FPDFPath_GetPathSegment:
+        unsafe extern "C" fn(FPDF_PAGEOBJECT, std::os::raw::c_int) -> FPDF_PATHSEGMENT,
+    pub FPDFPathSegment_GetPoint:
+        unsafe extern "C" fn(FPDF_PATHSEGMENT, *mut f32, *mut f32) -> FPDF_BOOL,
+    pub FPDFPathSegment_GetType: unsafe extern "C" fn(FPDF_PATHSEGMENT) -> std::os::raw::c_int,
+    pub FPDFPathSegment_GetClose: unsafe extern "C" fn(FPDF_PATHSEGMENT) -> FPDF_BOOL,
 
     // -- TextPage --
     pub FPDFText_LoadPage: unsafe extern "C" fn(FPDF_PAGE) -> FPDF_TEXTPAGE,
@@ -81,6 +251,15 @@ pub struct PdfiumBindings {
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_uint,
     pub FPDFText_GetCharCode:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_uint,
+    /// Fork API (chromium/8028+); absent in older fork builds, so optional.
+    pub FPDFText_GetCharInfoBatch: Option<
+        unsafe extern "C" fn(
+            FPDF_TEXTPAGE,
+            std::os::raw::c_int,
+            std::os::raw::c_int,
+            *mut FPDF_CHARINFO_LP,
+        ) -> std::os::raw::c_int,
+    >,
     pub FPDFText_GetFontSize: unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> f64,
     pub FPDFText_GetFontWeight:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_int,
@@ -102,9 +281,13 @@ pub struct PdfiumBindings {
     ) -> FPDF_BOOL,
     pub FPDFText_GetLooseCharBox:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int, *mut FS_RECTF) -> FPDF_BOOL,
+    pub FPDFText_GetCharOrigin:
+        unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int, *mut f64, *mut f64) -> FPDF_BOOL,
     pub FPDFText_GetMatrix:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int, *mut FS_MATRIX) -> FPDF_BOOL,
     pub FPDFText_IsGenerated:
+        unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_int,
+    pub FPDFText_IsHyphen:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_int,
     pub FPDFText_HasUnicodeMapError:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_int,
@@ -169,6 +352,7 @@ pub struct PdfiumBindings {
     pub FPDFBitmap_GetWidth: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
     pub FPDFBitmap_GetHeight: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
     pub FPDFBitmap_GetStride: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
+    pub FPDFBitmap_GetFormat: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
     pub FPDFBitmap_GetBuffer: unsafe extern "C" fn(FPDF_BITMAP) -> *mut std::os::raw::c_void,
     pub FPDFBitmap_FillRect: unsafe extern "C" fn(
         FPDF_BITMAP,
@@ -202,6 +386,212 @@ pub struct PdfiumBindings {
     pub FPDFFont_GetGlyphWidth: unsafe extern "C" fn(FPDF_FONT, u32, f32, *mut f32) -> FPDF_BOOL,
     pub FPDFFont_GetGlyphWidthFromCharCode:
         unsafe extern "C" fn(FPDF_FONT, u32, f32, *mut f32) -> FPDF_BOOL,
+    pub FPDFFont_GetGlyphPathFromCharCode:
+        unsafe extern "C" fn(FPDF_FONT, u32, f32) -> FPDF_GLYPHPATH,
+    pub FPDFGlyphPath_CountGlyphSegments:
+        unsafe extern "C" fn(FPDF_GLYPHPATH) -> std::os::raw::c_int,
+    pub FPDFGlyphPath_GetGlyphPathSegment:
+        unsafe extern "C" fn(FPDF_GLYPHPATH, std::os::raw::c_int) -> FPDF_PATHSEGMENT,
+    pub FPDFFont_HasToUnicode: unsafe extern "C" fn(FPDF_FONT) -> FPDF_BOOL,
+    pub FPDFFont_GetCharGlyphName: unsafe extern "C" fn(
+        FPDF_FONT,
+        u32,
+        *mut std::os::raw::c_char,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFFont_GetEncoding: unsafe extern "C" fn(
+        FPDF_FONT,
+        *mut std::os::raw::c_char,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFFont_GetCharGlyphIndex: unsafe extern "C" fn(FPDF_FONT, u32) -> std::os::raw::c_int,
+    pub FPDFFont_GetFontData:
+        unsafe extern "C" fn(FPDF_FONT, *mut u8, usize, *mut usize) -> FPDF_BOOL,
+
+    // -- Outline (bookmarks) --
+    pub FPDFBookmark_GetFirstChild:
+        unsafe extern "C" fn(FPDF_DOCUMENT, FPDF_BOOKMARK) -> FPDF_BOOKMARK,
+    pub FPDFBookmark_GetNextSibling:
+        unsafe extern "C" fn(FPDF_DOCUMENT, FPDF_BOOKMARK) -> FPDF_BOOKMARK,
+    pub FPDFBookmark_GetTitle: unsafe extern "C" fn(
+        FPDF_BOOKMARK,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFBookmark_GetDest: unsafe extern "C" fn(FPDF_DOCUMENT, FPDF_BOOKMARK) -> FPDF_DEST,
+    pub FPDFBookmark_GetAction: unsafe extern "C" fn(FPDF_BOOKMARK) -> FPDF_ACTION,
+    pub FPDFAction_GetDest: unsafe extern "C" fn(FPDF_DOCUMENT, FPDF_ACTION) -> FPDF_DEST,
+    pub FPDFAction_GetURIPath: unsafe extern "C" fn(
+        FPDF_DOCUMENT,
+        FPDF_ACTION,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFLink_Enumerate:
+        unsafe extern "C" fn(FPDF_PAGE, *mut std::os::raw::c_int, *mut FPDF_LINK) -> FPDF_BOOL,
+    pub FPDFLink_GetAction: unsafe extern "C" fn(FPDF_LINK) -> FPDF_ACTION,
+    pub FPDFLink_GetAnnotRect: unsafe extern "C" fn(FPDF_LINK, *mut FS_RECTF) -> FPDF_BOOL,
+    pub FPDFLink_CountQuadPoints: unsafe extern "C" fn(FPDF_LINK) -> std::os::raw::c_int,
+    pub FPDFLink_GetQuadPoints:
+        unsafe extern "C" fn(FPDF_LINK, std::os::raw::c_int, *mut FS_QUADPOINTSF) -> FPDF_BOOL,
+    // -- Annotations --
+    pub FPDFPage_GetAnnotCount: unsafe extern "C" fn(FPDF_PAGE) -> std::os::raw::c_int,
+    pub FPDFPage_GetAnnot: unsafe extern "C" fn(FPDF_PAGE, std::os::raw::c_int) -> FPDF_ANNOTATION,
+    pub FPDFPage_CloseAnnot: unsafe extern "C" fn(FPDF_ANNOTATION),
+    pub FPDFAnnot_GetSubtype: unsafe extern "C" fn(FPDF_ANNOTATION) -> FPDF_ANNOTATION_SUBTYPE,
+    pub FPDFAnnot_GetStringValue: unsafe extern "C" fn(
+        FPDF_ANNOTATION,
+        FPDF_BYTESTRING,
+        *mut FPDF_WCHAR,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFAnnot_HasKey: unsafe extern "C" fn(FPDF_ANNOTATION, FPDF_BYTESTRING) -> FPDF_BOOL,
+    pub FPDFAnnot_GetRect: unsafe extern "C" fn(FPDF_ANNOTATION, *mut FS_RECTF) -> FPDF_BOOL,
+    pub FPDFAnnot_HasAttachmentPoints: unsafe extern "C" fn(FPDF_ANNOTATION) -> FPDF_BOOL,
+    pub FPDFAnnot_CountAttachmentPoints: unsafe extern "C" fn(FPDF_ANNOTATION) -> usize,
+    pub FPDFAnnot_GetAttachmentPoints:
+        unsafe extern "C" fn(FPDF_ANNOTATION, usize, *mut FS_QUADPOINTSF) -> FPDF_BOOL,
+    pub FPDFAnnot_GetLink: unsafe extern "C" fn(FPDF_ANNOTATION) -> FPDF_LINK,
+    pub FPDFAnnot_GetLinkedAnnot:
+        unsafe extern "C" fn(FPDF_ANNOTATION, FPDF_BYTESTRING) -> FPDF_ANNOTATION,
+    pub FPDFAnnot_GetObjNum: unsafe extern "C" fn(FPDF_ANNOTATION) -> std::os::raw::c_int,
+    pub FPDFAnnot_GetFlags: unsafe extern "C" fn(FPDF_ANNOTATION) -> std::os::raw::c_int,
+    pub FPDFAnnot_SetFlags:
+        Option<unsafe extern "C" fn(FPDF_ANNOTATION, std::os::raw::c_int) -> FPDF_BOOL>,
+    pub FPDFAnnot_GetObjectCount: unsafe extern "C" fn(FPDF_ANNOTATION) -> std::os::raw::c_int,
+    pub FPDFAnnot_GetObject:
+        unsafe extern "C" fn(FPDF_ANNOTATION, std::os::raw::c_int) -> FPDF_PAGEOBJECT,
+    pub FPDFAnnot_GetFormFieldFlags:
+        unsafe extern "C" fn(FPDF_FORMHANDLE, FPDF_ANNOTATION) -> std::os::raw::c_int,
+    pub FPDFAnnot_GetFormFieldName: unsafe extern "C" fn(
+        FPDF_FORMHANDLE,
+        FPDF_ANNOTATION,
+        *mut FPDF_WCHAR,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFAnnot_GetFormFieldAlternateName: unsafe extern "C" fn(
+        FPDF_FORMHANDLE,
+        FPDF_ANNOTATION,
+        *mut FPDF_WCHAR,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFAnnot_GetFormFieldType:
+        unsafe extern "C" fn(FPDF_FORMHANDLE, FPDF_ANNOTATION) -> std::os::raw::c_int,
+    pub FPDFAnnot_GetFormFieldValue: unsafe extern "C" fn(
+        FPDF_FORMHANDLE,
+        FPDF_ANNOTATION,
+        *mut FPDF_WCHAR,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFAnnot_GetFormFieldExportValue: unsafe extern "C" fn(
+        FPDF_FORMHANDLE,
+        FPDF_ANNOTATION,
+        *mut FPDF_WCHAR,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFAnnot_GetOptionCount:
+        unsafe extern "C" fn(FPDF_FORMHANDLE, FPDF_ANNOTATION) -> std::os::raw::c_int,
+    pub FPDFAnnot_GetOptionLabel: unsafe extern "C" fn(
+        FPDF_FORMHANDLE,
+        FPDF_ANNOTATION,
+        std::os::raw::c_int,
+        *mut FPDF_WCHAR,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFAnnot_IsOptionSelected:
+        unsafe extern "C" fn(FPDF_FORMHANDLE, FPDF_ANNOTATION, std::os::raw::c_int) -> FPDF_BOOL,
+    pub FPDFAnnot_IsChecked: unsafe extern "C" fn(FPDF_FORMHANDLE, FPDF_ANNOTATION) -> FPDF_BOOL,
+    pub FPDFAnnot_GetFormControlCount:
+        unsafe extern "C" fn(FPDF_FORMHANDLE, FPDF_ANNOTATION) -> std::os::raw::c_int,
+    pub FPDFAnnot_GetFormControlIndex:
+        unsafe extern "C" fn(FPDF_FORMHANDLE, FPDF_ANNOTATION) -> std::os::raw::c_int,
+    pub FPDFDest_GetDestPageIndex:
+        unsafe extern "C" fn(FPDF_DOCUMENT, FPDF_DEST) -> std::os::raw::c_int,
+    pub FPDFDest_GetLocationInPage: unsafe extern "C" fn(
+        FPDF_DEST,
+        *mut FPDF_BOOL,
+        *mut FPDF_BOOL,
+        *mut FPDF_BOOL,
+        *mut FS_FLOAT,
+        *mut FS_FLOAT,
+        *mut FS_FLOAT,
+    ) -> FPDF_BOOL,
+
+    // -- Structure tree --
+    pub FPDF_StructTree_GetForPage: unsafe extern "C" fn(FPDF_PAGE) -> FPDF_STRUCTTREE,
+    pub FPDF_StructTree_Close: unsafe extern "C" fn(FPDF_STRUCTTREE),
+    pub FPDF_StructTree_CountChildren: unsafe extern "C" fn(FPDF_STRUCTTREE) -> std::os::raw::c_int,
+    pub FPDF_StructTree_GetChildAtIndex:
+        unsafe extern "C" fn(FPDF_STRUCTTREE, std::os::raw::c_int) -> FPDF_STRUCTELEMENT,
+    pub FPDF_StructElement_GetType: unsafe extern "C" fn(
+        FPDF_STRUCTELEMENT,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDF_StructElement_GetAltText: unsafe extern "C" fn(
+        FPDF_STRUCTELEMENT,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDF_StructElement_GetActualText: unsafe extern "C" fn(
+        FPDF_STRUCTELEMENT,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDF_StructElement_GetID: unsafe extern "C" fn(
+        FPDF_STRUCTELEMENT,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDF_StructElement_GetTitle: unsafe extern "C" fn(
+        FPDF_STRUCTELEMENT,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDF_StructElement_CountChildren:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT) -> std::os::raw::c_int,
+    pub FPDF_StructElement_GetChildAtIndex:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT, std::os::raw::c_int) -> FPDF_STRUCTELEMENT,
+    pub FPDF_StructElement_GetChildMarkedContentID:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT, std::os::raw::c_int) -> std::os::raw::c_int,
+    pub FPDF_StructElement_GetMarkedContentID:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT) -> std::os::raw::c_int,
+    pub FPDF_StructElement_GetMarkedContentIdCount:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT) -> std::os::raw::c_int,
+    pub FPDF_StructElement_GetMarkedContentIdAtIndex:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT, std::os::raw::c_int) -> std::os::raw::c_int,
+    pub FPDF_StructElement_GetChildObjNum:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT, std::os::raw::c_int) -> std::os::raw::c_int,
+    pub FPDF_StructElement_GetAttributeCount:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT) -> std::os::raw::c_int,
+    pub FPDF_StructElement_GetAttributeAtIndex:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT, std::os::raw::c_int) -> FPDF_STRUCTELEMENT_ATTR,
+    pub FPDF_StructElement_Attr_GetCount:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT_ATTR) -> std::os::raw::c_int,
+    pub FPDF_StructElement_Attr_GetName: unsafe extern "C" fn(
+        FPDF_STRUCTELEMENT_ATTR,
+        std::os::raw::c_int,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+        *mut std::os::raw::c_ulong,
+    ) -> FPDF_BOOL,
+    pub FPDF_StructElement_Attr_GetValue: unsafe extern "C" fn(
+        FPDF_STRUCTELEMENT_ATTR,
+        FPDF_BYTESTRING,
+    )
+        -> FPDF_STRUCTELEMENT_ATTR_VALUE,
+    pub FPDF_StructElement_Attr_GetType:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT_ATTR_VALUE) -> FPDF_OBJECT_TYPE,
+    pub FPDF_StructElement_Attr_GetBooleanValue:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT_ATTR_VALUE, *mut FPDF_BOOL) -> FPDF_BOOL,
+    pub FPDF_StructElement_Attr_GetNumberValue:
+        unsafe extern "C" fn(FPDF_STRUCTELEMENT_ATTR_VALUE, *mut f32) -> FPDF_BOOL,
+    pub FPDF_StructElement_Attr_GetStringValue: unsafe extern "C" fn(
+        FPDF_STRUCTELEMENT_ATTR_VALUE,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+        *mut std::os::raw::c_ulong,
+    ) -> FPDF_BOOL,
 }
 
 // SAFETY: PdfiumBindings contains only function pointers and a Library handle.
@@ -219,12 +609,43 @@ impl PdfiumBindings {
             FPDF_LoadMemDocument: load_fn!(lib, "FPDF_LoadMemDocument"),
             FPDF_CloseDocument: load_fn!(lib, "FPDF_CloseDocument"),
             FPDF_GetPageCount: load_fn!(lib, "FPDF_GetPageCount"),
+            FPDF_GetPageSizeByIndexF: load_fn!(lib, "FPDF_GetPageSizeByIndexF"),
+            FPDF_GetFormType: load_fn!(lib, "FPDF_GetFormType"),
+            FPDFCatalog_IsTagged: load_fn!(lib, "FPDFCatalog_IsTagged"),
+            FPDFDOC_InitFormFillEnvironment: load_fn!(lib, "FPDFDOC_InitFormFillEnvironment"),
+            FPDFDOC_ExitFormFillEnvironment: load_fn!(lib, "FPDFDOC_ExitFormFillEnvironment"),
+            FORM_OnAfterLoadPage: load_fn!(lib, "FORM_OnAfterLoadPage"),
+            FORM_OnBeforeClosePage: load_fn!(lib, "FORM_OnBeforeClosePage"),
+            FORM_DoDocumentJSAction: load_fn!(lib, "FORM_DoDocumentJSAction"),
+            FORM_DoDocumentOpenAction: load_fn!(lib, "FORM_DoDocumentOpenAction"),
+            FORM_DoPageAAction: load_fn!(lib, "FORM_DoPageAAction"),
+            FPDF_FFLDraw: load_fn!(lib, "FPDF_FFLDraw"),
+            FPDF_GetMetaText: load_fn!(lib, "FPDF_GetMetaText"),
+            FPDF_GetPageLabel: load_fn!(lib, "FPDF_GetPageLabel"),
+            FPDF_GetFileVersion: load_fn!(lib, "FPDF_GetFileVersion"),
+            FPDF_GetSecurityHandlerRevision: load_fn!(lib, "FPDF_GetSecurityHandlerRevision"),
+            FPDF_GetDocPermissions: load_fn!(lib, "FPDF_GetDocPermissions"),
+            FPDF_GetSignatureCount: load_fn_opt!(lib, "FPDF_GetSignatureCount"),
+            FPDF_GetSignatureObject: load_fn_opt!(lib, "FPDF_GetSignatureObject"),
+            FPDFSignatureObj_GetByteRange: load_fn_opt!(lib, "FPDFSignatureObj_GetByteRange"),
+            FPDF_GetXFAPacketCount: load_fn!(lib, "FPDF_GetXFAPacketCount"),
+            FPDF_GetXFAPacketName: load_fn!(lib, "FPDF_GetXFAPacketName"),
+            FPDF_GetXFAPacketContent: load_fn!(lib, "FPDF_GetXFAPacketContent"),
             FPDF_LoadPage: load_fn!(lib, "FPDF_LoadPage"),
             FPDF_ClosePage: load_fn!(lib, "FPDF_ClosePage"),
             FPDF_GetPageWidthF: load_fn!(lib, "FPDF_GetPageWidthF"),
             FPDF_GetPageHeightF: load_fn!(lib, "FPDF_GetPageHeightF"),
             FPDF_GetPageBoundingBox: load_fn!(lib, "FPDF_GetPageBoundingBox"),
             FPDFPage_GetRotation: load_fn!(lib, "FPDFPage_GetRotation"),
+            FPDFPage_SetRotation: load_fn!(lib, "FPDFPage_SetRotation"),
+            FPDFPage_SetCropBox: load_fn!(lib, "FPDFPage_SetCropBox"),
+            FPDFPage_GetUserUnit: load_fn_opt!(lib, "FPDFPage_GetUserUnit"),
+            FPDFPage_Flatten: load_fn_opt!(lib, "FPDFPage_Flatten"),
+            FPDF_CreateNewDocument: load_fn_opt!(lib, "FPDF_CreateNewDocument"),
+            FPDF_ImportPagesByIndex: load_fn_opt!(lib, "FPDF_ImportPagesByIndex"),
+            FPDFPage_RemoveObject: load_fn_opt!(lib, "FPDFPage_RemoveObject"),
+            FPDFPageObj_Destroy: load_fn_opt!(lib, "FPDFPageObj_Destroy"),
+            FPDFPage_GenerateContent: load_fn_opt!(lib, "FPDFPage_GenerateContent"),
             FPDF_PageToDevice: load_fn!(lib, "FPDF_PageToDevice"),
             FPDFPage_CountObjects: load_fn!(lib, "FPDFPage_CountObjects"),
             FPDFPage_GetObject: load_fn!(lib, "FPDFPage_GetObject"),
@@ -232,19 +653,45 @@ impl PdfiumBindings {
             FPDFPageObj_GetBounds: load_fn!(lib, "FPDFPageObj_GetBounds"),
             FPDFPageObj_GetMarkedContentID: load_fn!(lib, "FPDFPageObj_GetMarkedContentID"),
             FPDFImageObj_GetRenderedBitmap: load_fn!(lib, "FPDFImageObj_GetRenderedBitmap"),
+            FPDFImageObj_GetBitmap: load_fn!(lib, "FPDFImageObj_GetBitmap"),
+            FPDFImageObj_GetImageDataDecoded: load_fn!(lib, "FPDFImageObj_GetImageDataDecoded"),
+            FPDFImageObj_GetImageDataRaw: load_fn!(lib, "FPDFImageObj_GetImageDataRaw"),
+            FPDFImageObj_GetImageFilterCount: load_fn!(lib, "FPDFImageObj_GetImageFilterCount"),
+            FPDFImageObj_GetImageFilter: load_fn!(lib, "FPDFImageObj_GetImageFilter"),
+            FPDFImageObj_GetImageMetadata: load_fn!(lib, "FPDFImageObj_GetImageMetadata"),
+            FPDFImageObj_GetImagePixelSize: load_fn!(lib, "FPDFImageObj_GetImagePixelSize"),
+            FPDFPageObj_GetClipPath: load_fn_opt!(lib, "FPDFPageObj_GetClipPath"),
+            FPDFClipPath_CountPaths: load_fn_opt!(lib, "FPDFClipPath_CountPaths"),
+            FPDFClipPath_CountPathSegments: load_fn_opt!(lib, "FPDFClipPath_CountPathSegments"),
+            FPDFClipPath_GetPathSegment: load_fn_opt!(lib, "FPDFClipPath_GetPathSegment"),
+            FPDFPageObj_GetMatrix: load_fn!(lib, "FPDFPageObj_GetMatrix"),
+            FPDFPageObj_GetStrokeColor: load_fn!(lib, "FPDFPageObj_GetStrokeColor"),
+            FPDFPageObj_GetFillColor: load_fn!(lib, "FPDFPageObj_GetFillColor"),
+            FPDFPageObj_GetStrokeWidth: load_fn!(lib, "FPDFPageObj_GetStrokeWidth"),
+            FPDFPath_GetDrawMode: load_fn!(lib, "FPDFPath_GetDrawMode"),
+            FPDFFormObj_CountObjects: load_fn!(lib, "FPDFFormObj_CountObjects"),
+            FPDFFormObj_GetObject: load_fn!(lib, "FPDFFormObj_GetObject"),
+            FPDFPath_CountSegments: load_fn!(lib, "FPDFPath_CountSegments"),
+            FPDFPath_GetPathSegment: load_fn!(lib, "FPDFPath_GetPathSegment"),
+            FPDFPathSegment_GetPoint: load_fn!(lib, "FPDFPathSegment_GetPoint"),
+            FPDFPathSegment_GetType: load_fn!(lib, "FPDFPathSegment_GetType"),
+            FPDFPathSegment_GetClose: load_fn!(lib, "FPDFPathSegment_GetClose"),
             FPDFText_LoadPage: load_fn!(lib, "FPDFText_LoadPage"),
             FPDFText_ClosePage: load_fn!(lib, "FPDFText_ClosePage"),
             FPDFText_CountChars: load_fn!(lib, "FPDFText_CountChars"),
             FPDFText_GetUnicode: load_fn!(lib, "FPDFText_GetUnicode"),
             FPDFText_GetCharCode: load_fn!(lib, "FPDFText_GetCharCode"),
+            FPDFText_GetCharInfoBatch: load_fn_opt!(lib, "FPDFText_GetCharInfoBatch"),
             FPDFText_GetFontSize: load_fn!(lib, "FPDFText_GetFontSize"),
             FPDFText_GetFontWeight: load_fn!(lib, "FPDFText_GetFontWeight"),
             FPDFText_GetFontInfo: load_fn!(lib, "FPDFText_GetFontInfo"),
             FPDFText_GetCharAngle: load_fn!(lib, "FPDFText_GetCharAngle"),
             FPDFText_GetCharBox: load_fn!(lib, "FPDFText_GetCharBox"),
             FPDFText_GetLooseCharBox: load_fn!(lib, "FPDFText_GetLooseCharBox"),
+            FPDFText_GetCharOrigin: load_fn!(lib, "FPDFText_GetCharOrigin"),
             FPDFText_GetMatrix: load_fn!(lib, "FPDFText_GetMatrix"),
             FPDFText_IsGenerated: load_fn!(lib, "FPDFText_IsGenerated"),
+            FPDFText_IsHyphen: load_fn!(lib, "FPDFText_IsHyphen"),
             FPDFText_HasUnicodeMapError: load_fn!(lib, "FPDFText_HasUnicodeMapError"),
             FPDFText_GetTextObject: load_fn!(lib, "FPDFText_GetTextObject"),
             FPDFText_GetStrokeColor: load_fn!(lib, "FPDFText_GetStrokeColor"),
@@ -259,6 +706,7 @@ impl PdfiumBindings {
             FPDFBitmap_GetWidth: load_fn!(lib, "FPDFBitmap_GetWidth"),
             FPDFBitmap_GetHeight: load_fn!(lib, "FPDFBitmap_GetHeight"),
             FPDFBitmap_GetStride: load_fn!(lib, "FPDFBitmap_GetStride"),
+            FPDFBitmap_GetFormat: load_fn!(lib, "FPDFBitmap_GetFormat"),
             FPDFBitmap_GetBuffer: load_fn!(lib, "FPDFBitmap_GetBuffer"),
             FPDFBitmap_FillRect: load_fn!(lib, "FPDFBitmap_FillRect"),
             FPDF_RenderPageBitmap: load_fn!(lib, "FPDF_RenderPageBitmap"),
@@ -270,6 +718,115 @@ impl PdfiumBindings {
             FPDFFont_GetDescent: load_fn!(lib, "FPDFFont_GetDescent"),
             FPDFFont_GetGlyphWidth: load_fn!(lib, "FPDFFont_GetGlyphWidth"),
             FPDFFont_GetGlyphWidthFromCharCode: load_fn!(lib, "FPDFFont_GetGlyphWidthFromCharCode"),
+            FPDFFont_GetGlyphPathFromCharCode: load_fn!(lib, "FPDFFont_GetGlyphPathFromCharCode"),
+            FPDFGlyphPath_CountGlyphSegments: load_fn!(lib, "FPDFGlyphPath_CountGlyphSegments"),
+            FPDFGlyphPath_GetGlyphPathSegment: load_fn!(lib, "FPDFGlyphPath_GetGlyphPathSegment"),
+            FPDFFont_HasToUnicode: load_fn!(lib, "FPDFFont_HasToUnicode"),
+            FPDFFont_GetCharGlyphName: load_fn!(lib, "FPDFFont_GetCharGlyphName"),
+            FPDFFont_GetEncoding: load_fn!(lib, "FPDFFont_GetEncoding"),
+            FPDFFont_GetCharGlyphIndex: load_fn!(lib, "FPDFFont_GetCharGlyphIndex"),
+            FPDFFont_GetFontData: load_fn!(lib, "FPDFFont_GetFontData"),
+
+            FPDFBookmark_GetFirstChild: load_fn!(lib, "FPDFBookmark_GetFirstChild"),
+            FPDFBookmark_GetNextSibling: load_fn!(lib, "FPDFBookmark_GetNextSibling"),
+            FPDFBookmark_GetTitle: load_fn!(lib, "FPDFBookmark_GetTitle"),
+            FPDFBookmark_GetDest: load_fn!(lib, "FPDFBookmark_GetDest"),
+            FPDFBookmark_GetAction: load_fn!(lib, "FPDFBookmark_GetAction"),
+            FPDFAction_GetDest: load_fn!(lib, "FPDFAction_GetDest"),
+            FPDFAction_GetURIPath: load_fn!(lib, "FPDFAction_GetURIPath"),
+            FPDFLink_Enumerate: load_fn!(lib, "FPDFLink_Enumerate"),
+            FPDFLink_GetAction: load_fn!(lib, "FPDFLink_GetAction"),
+            FPDFLink_GetAnnotRect: load_fn!(lib, "FPDFLink_GetAnnotRect"),
+            FPDFLink_CountQuadPoints: load_fn!(lib, "FPDFLink_CountQuadPoints"),
+            FPDFLink_GetQuadPoints: load_fn!(lib, "FPDFLink_GetQuadPoints"),
+            FPDFPage_GetAnnotCount: load_fn!(lib, "FPDFPage_GetAnnotCount"),
+            FPDFPage_GetAnnot: load_fn!(lib, "FPDFPage_GetAnnot"),
+            FPDFPage_CloseAnnot: load_fn!(lib, "FPDFPage_CloseAnnot"),
+            FPDFAnnot_GetSubtype: load_fn!(lib, "FPDFAnnot_GetSubtype"),
+            FPDFAnnot_GetStringValue: load_fn!(lib, "FPDFAnnot_GetStringValue"),
+            FPDFAnnot_HasKey: load_fn!(lib, "FPDFAnnot_HasKey"),
+            FPDFAnnot_GetRect: load_fn!(lib, "FPDFAnnot_GetRect"),
+            FPDFAnnot_HasAttachmentPoints: load_fn!(lib, "FPDFAnnot_HasAttachmentPoints"),
+            FPDFAnnot_CountAttachmentPoints: load_fn!(lib, "FPDFAnnot_CountAttachmentPoints"),
+            FPDFAnnot_GetAttachmentPoints: load_fn!(lib, "FPDFAnnot_GetAttachmentPoints"),
+            FPDFAnnot_GetLink: load_fn!(lib, "FPDFAnnot_GetLink"),
+            FPDFAnnot_GetLinkedAnnot: load_fn!(lib, "FPDFAnnot_GetLinkedAnnot"),
+            FPDFAnnot_GetObjNum: load_fn!(lib, "FPDFAnnot_GetObjNum"),
+            FPDFAnnot_GetFlags: load_fn!(lib, "FPDFAnnot_GetFlags"),
+            FPDFAnnot_SetFlags: load_fn_opt!(lib, "FPDFAnnot_SetFlags"),
+            FPDFAnnot_GetObjectCount: load_fn!(lib, "FPDFAnnot_GetObjectCount"),
+            FPDFAnnot_GetObject: load_fn!(lib, "FPDFAnnot_GetObject"),
+            FPDFAnnot_GetFormFieldFlags: load_fn!(lib, "FPDFAnnot_GetFormFieldFlags"),
+            FPDFAnnot_GetFormFieldName: load_fn!(lib, "FPDFAnnot_GetFormFieldName"),
+            FPDFAnnot_GetFormFieldAlternateName: load_fn!(
+                lib,
+                "FPDFAnnot_GetFormFieldAlternateName"
+            ),
+            FPDFAnnot_GetFormFieldType: load_fn!(lib, "FPDFAnnot_GetFormFieldType"),
+            FPDFAnnot_GetFormFieldValue: load_fn!(lib, "FPDFAnnot_GetFormFieldValue"),
+            FPDFAnnot_GetFormFieldExportValue: load_fn!(lib, "FPDFAnnot_GetFormFieldExportValue"),
+            FPDFAnnot_GetOptionCount: load_fn!(lib, "FPDFAnnot_GetOptionCount"),
+            FPDFAnnot_GetOptionLabel: load_fn!(lib, "FPDFAnnot_GetOptionLabel"),
+            FPDFAnnot_IsOptionSelected: load_fn!(lib, "FPDFAnnot_IsOptionSelected"),
+            FPDFAnnot_IsChecked: load_fn!(lib, "FPDFAnnot_IsChecked"),
+            FPDFAnnot_GetFormControlCount: load_fn!(lib, "FPDFAnnot_GetFormControlCount"),
+            FPDFAnnot_GetFormControlIndex: load_fn!(lib, "FPDFAnnot_GetFormControlIndex"),
+            FPDFDest_GetDestPageIndex: load_fn!(lib, "FPDFDest_GetDestPageIndex"),
+            FPDFDest_GetLocationInPage: load_fn!(lib, "FPDFDest_GetLocationInPage"),
+
+            FPDF_StructTree_GetForPage: load_fn!(lib, "FPDF_StructTree_GetForPage"),
+            FPDF_StructTree_Close: load_fn!(lib, "FPDF_StructTree_Close"),
+            FPDF_StructTree_CountChildren: load_fn!(lib, "FPDF_StructTree_CountChildren"),
+            FPDF_StructTree_GetChildAtIndex: load_fn!(lib, "FPDF_StructTree_GetChildAtIndex"),
+            FPDF_StructElement_GetType: load_fn!(lib, "FPDF_StructElement_GetType"),
+            FPDF_StructElement_GetAltText: load_fn!(lib, "FPDF_StructElement_GetAltText"),
+            FPDF_StructElement_GetActualText: load_fn!(lib, "FPDF_StructElement_GetActualText"),
+            FPDF_StructElement_GetID: load_fn!(lib, "FPDF_StructElement_GetID"),
+            FPDF_StructElement_GetTitle: load_fn!(lib, "FPDF_StructElement_GetTitle"),
+            FPDF_StructElement_CountChildren: load_fn!(lib, "FPDF_StructElement_CountChildren"),
+            FPDF_StructElement_GetChildAtIndex: load_fn!(lib, "FPDF_StructElement_GetChildAtIndex"),
+            FPDF_StructElement_GetChildMarkedContentID: load_fn!(
+                lib,
+                "FPDF_StructElement_GetChildMarkedContentID"
+            ),
+            FPDF_StructElement_GetMarkedContentID: load_fn!(
+                lib,
+                "FPDF_StructElement_GetMarkedContentID"
+            ),
+            FPDF_StructElement_GetMarkedContentIdCount: load_fn!(
+                lib,
+                "FPDF_StructElement_GetMarkedContentIdCount"
+            ),
+            FPDF_StructElement_GetMarkedContentIdAtIndex: load_fn!(
+                lib,
+                "FPDF_StructElement_GetMarkedContentIdAtIndex"
+            ),
+            FPDF_StructElement_GetChildObjNum: load_fn!(lib, "FPDF_StructElement_GetChildObjNum"),
+            FPDF_StructElement_GetAttributeCount: load_fn!(
+                lib,
+                "FPDF_StructElement_GetAttributeCount"
+            ),
+            FPDF_StructElement_GetAttributeAtIndex: load_fn!(
+                lib,
+                "FPDF_StructElement_GetAttributeAtIndex"
+            ),
+            FPDF_StructElement_Attr_GetCount: load_fn!(lib, "FPDF_StructElement_Attr_GetCount"),
+            FPDF_StructElement_Attr_GetName: load_fn!(lib, "FPDF_StructElement_Attr_GetName"),
+            FPDF_StructElement_Attr_GetValue: load_fn!(lib, "FPDF_StructElement_Attr_GetValue"),
+            FPDF_StructElement_Attr_GetType: load_fn!(lib, "FPDF_StructElement_Attr_GetType"),
+            FPDF_StructElement_Attr_GetBooleanValue: load_fn!(
+                lib,
+                "FPDF_StructElement_Attr_GetBooleanValue"
+            ),
+            FPDF_StructElement_Attr_GetNumberValue: load_fn!(
+                lib,
+                "FPDF_StructElement_Attr_GetNumberValue"
+            ),
+            FPDF_StructElement_Attr_GetStringValue: load_fn!(
+                lib,
+                "FPDF_StructElement_Attr_GetStringValue"
+            ),
+
             _lib: lib,
         })
     }
@@ -396,10 +953,10 @@ fn search_paths() -> Vec<PathBuf> {
     }
 
     // 4. Next to the current executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            paths.push(exe_dir.join(name));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        paths.push(exe_dir.join(name));
     }
 
     // 5. Bare library name (system search paths / LD_LIBRARY_PATH / DYLD_LIBRARY_PATH / PATH)

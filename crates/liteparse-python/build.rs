@@ -1,9 +1,9 @@
 use std::env;
 
 fn main() {
-    // Get the pdfium lib path from the pdfium-sys link metadata
-    let lib_path =
-        env::var("DEP_PDFIUM_LIB_PATH").expect("DEP_PDFIUM_LIB_PATH not set (from pdfium-sys)");
+    // Get the pdfium lib path from the pdfium-sys link metadata. The hayro
+    // backend links no native PDF library, so it is normally absent.
+    let lib_path = env::var("DEP_PDFIUM_LIB_PATH").ok();
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
@@ -20,5 +20,7 @@ fn main() {
     }
 
     // Emit the lib path so maturin/CI scripts can find and bundle libpdfium
-    println!("cargo:rustc-env=PDFIUM_LIB_DIR={lib_path}");
+    if let Some(lib_path) = lib_path {
+        println!("cargo:rustc-env=PDFIUM_LIB_DIR={lib_path}");
+    }
 }

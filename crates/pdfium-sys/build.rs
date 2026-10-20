@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const PDFIUM_RELEASE_TAG: &str = "chromium/7870";
+const PDFIUM_RELEASE_TAG: &str = "chromium/8058";
 const PDFIUM_RELEASE_URL: &str = "https://github.com/run-llama/pdfium-binaries/releases/download";
 
 fn main() {
@@ -41,6 +41,19 @@ fn main() {
         println!("cargo:rustc-link-lib=static=c++abi");
         println!("cargo:rustc-link-lib=static=wasi-emulated-mman");
         println!("cargo:rustc-link-lib=static=wasi-emulated-signal");
+        // Newer pdfium-binaries releases ship the wasm setjmp/longjmp runtime
+        // in a standalone libsetjmp.a, which pdfium's bundled libjpeg/freetype
+        // reference for their __c_longjmp error handling. Older releases folded
+        // these into libc.a, so only link it when the archive is present.
+        //
+        // NOTE: libsetjmp.a's single object also redefines the __wasm_setjmp/
+        // __wasm_longjmp helpers that Rust's own codegen emits. The
+        // --allow-multiple-definition link-arg needed to tolerate that lives in
+        // the final cdylib's build script (crates/liteparse-wasm/build.rs),
+        // because rustc-link-arg does not propagate to dependent crates.
+        if lib_dir.join("libsetjmp.a").exists() {
+            println!("cargo:rustc-link-lib=static=setjmp");
+        }
         println!("cargo:lib_path={}", lib_dir.display());
     } else {
         // Non-wasm: pdfium is loaded at runtime via libloading (no link-time
@@ -256,6 +269,7 @@ fn run_bindgen(include_dir: &Path) {
             .header("wrapper.h")
             .clang_arg(format!("-I{}", include_dir.display()))
             .allowlist_function("FPDF.*")
+            .allowlist_function("FORM_.*")
             .allowlist_function("FPDFText_.*")
             .allowlist_function("FPDFPage.*")
             .allowlist_function("FPDFLink_.*")
@@ -263,6 +277,7 @@ fn run_bindgen(include_dir: &Path) {
             .allowlist_type("FPDF.*")
             .allowlist_type("FS_.*")
             .allowlist_var("FPDF.*")
+            .allowlist_var("FLAT.*")
             .derive_debug(true)
             .derive_default(true)
             .layout_tests(false)

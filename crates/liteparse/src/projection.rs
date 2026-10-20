@@ -14,6 +14,15 @@ const FLOWING_COLUMN_GAP_MULTIPLIER: f32 = 4.0;
 const FLOWING_MIN_LINE_ITEMS: usize = 3;
 const FLOWING_SPACE_HEIGHT_RATIO: f32 = 0.15;
 const FLOWING_SPACE_MIN_THRESHOLD: f32 = 0.3;
+// Space threshold as a fraction of the line's median character advance
+// (horizontal em proxy), used to bound the height-based threshold from above.
+// `height*0.15` over-estimates the inter-word gap for tall display/heading
+// fonts (their ascender+leading make them ~2.7× their advance vs ~2× for body
+// text), so it sits above the genuine word gaps and swallows the spaces
+// ("WhichJournalistsdoPeople"). 0.30 is the body-text crossover — body height ≈
+// 2×advance, so `advance*0.30 ≈ height*0.15` — so taking the smaller of the two
+// leaves body text unchanged and only bites tall fonts.
+const FLOWING_SPACE_ADV_RATIO: f32 = 0.30;
 const FLOWING_MAX_INDENT: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +191,25 @@ fn handle_rotation_reading_order(items: &mut [ProjectedTextItem], page_height: f
             continue;
         }
 
+        // Long-span guard: a rotated group whose screen-space extent along its
+        // reading direction spans a large fraction of the page is almost
+        // always sidebar/marginalia (page footers, signature stamps, vertical
+        // disclaimers on legal/scanned docs) — never an inline label. Force the
+        // separate-block branch so it doesn't get flattened onto body lines.
+        //
+        // For 90/270° text the reading direction is screen-vertical, so the
+        // group's vertical screen span is the relevant axis.
+        let group_min_y = group
+            .iter()
+            .map(|idx| items[*idx].item.y)
+            .fold(f32::INFINITY, f32::min);
+        let group_max_y = group
+            .iter()
+            .map(|idx| items[*idx].item.y + items[*idx].item.height)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let group_vspan = (group_max_y - group_min_y).max(0.0);
+        let long_span = page_height > 0.0 && group_vspan > page_height * 0.4;
+
         // Check if non-rotated/other-rotated items visually overlap or are near this group.
         // Use a proximity margin so rotated labels in diagrams (e.g. pin diagrams)
         // that are close to but don't strictly overlap non-rotated items are kept inline.
@@ -210,7 +238,7 @@ fn handle_rotation_reading_order(items: &mut [ProjectedTextItem], page_height: f
             }
         }
 
-        if global_overlap {
+        if global_overlap && !long_span {
             // For 90/270° groups kept inline, compute a common y from the
             // group's average vertical midpoint so all labels land on one row.
             // Keep original w/h to preserve x-spacing between labels.
@@ -294,7 +322,19 @@ fn handle_rotation_reading_order(items: &mut [ProjectedTextItem], page_height: f
                 }
             }
 
-            let global_delta = delta_y + group_max_x + page_height;
+            // Push later groups just below the block. `delta_y` already includes
+            // earlier pushes, so pushing by the block's absolute bottom compounds them.
+            let block_bottom = delta_y + group_max_x;
+            let later_top = bbox_groups[(group_idx + 1)..]
+                .iter()
+                .flatten()
+                .map(|idx| items[*idx].item.y + items[*idx].d)
+                .fold(f32::INFINITY, f32::min);
+            let global_delta = if later_top.is_finite() {
+                (block_bottom + page_height - later_top).max(0.0)
+            } else {
+                0.0
+            };
             for other_group in &bbox_groups[(group_idx + 1)..] {
                 for idx in other_group {
                     let rot = canonical_rotation(items[*idx].item.rotation);
@@ -392,6 +432,37 @@ fn form_lines(
     // Y-tolerance for sorting: items within this threshold are considered same line
     let y_sort_tolerance: f32 = (median_height * 0.5).max(5.0);
 
+    let dbg_lines = std::env::var("LITEPARSE_DEBUG_LINES").is_ok();
+    let dump_lines = |stage: &str, lines: &[Vec<ProjectedTextItem>]| {
+        if !dbg_lines {
+            return;
+        }
+        eprintln!(
+            "[form_lines:{stage}] {} lines (mh={median_height:.1})",
+            lines.len()
+        );
+        for (li, ln) in lines.iter().enumerate() {
+            if ln.is_empty() {
+                continue;
+            }
+            let min_y = ln.iter().map(|i| i.item.y).fold(f32::INFINITY, f32::min);
+            let max_y = ln
+                .iter()
+                .map(|i| i.item.y + i.item.height)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let txt: String = ln
+                .iter()
+                .map(|i| i.item.text.trim())
+                .collect::<Vec<_>>()
+                .join("|");
+            eprintln!(
+                "  [{li:2}] y={min_y:.1}..{max_y:.1} n={} {:.70}",
+                ln.len(),
+                txt
+            );
+        }
+    };
+
     // For two-column documents, detect and mark margin line numbers
     if page_width > 0.0 {
         let midpoint = page_width / 2.0;
@@ -421,16 +492,39 @@ fn form_lines(
             (1..=2).contains(&digit_count)
         }
 
-        for item in items.iter_mut() {
-            let center = item.item.x + item.item.width / 2.0;
+        // A real gutter line number is isolated on its baseline. An item that
+        // abuts a neighbour is a fragment of a larger token, e.g. the "7" of a
+        // table cell PDFium emits as "7" + ".7" (issue #465).
+        fn abuts_neighbour(items: &[ProjectedTextItem], idx: usize) -> bool {
+            let it = &items[idx].item;
+            let max_gap = it.height * 0.25;
+            items.iter().enumerate().any(|(j, other)| {
+                if j == idx {
+                    return false;
+                }
+                let o = &other.item;
+                if (o.y - it.y).abs() > it.height * 0.5 {
+                    return false;
+                }
+                let gap_right = o.x - (it.x + it.width);
+                let gap_left = it.x - (o.x + o.width);
+                (-0.5..=max_gap).contains(&gap_right) || (-0.5..=max_gap).contains(&gap_left)
+            })
+        }
 
-            if center > margin_left
-                && center < margin_right
-                && is_margin_line_number_text(&item.item.text)
-                && item.item.width < 15.0
-            {
-                item.is_margin_line_number = true;
-            }
+        let margin_idxs: Vec<usize> = (0..items.len())
+            .filter(|&i| {
+                let item = &items[i];
+                let center = item.item.x + item.item.width / 2.0;
+                center > margin_left
+                    && center < margin_right
+                    && is_margin_line_number_text(&item.item.text)
+                    && item.item.width < 15.0
+                    && !abuts_neighbour(items, i)
+            })
+            .collect();
+        for i in margin_idxs {
+            items[i].is_margin_line_number = true;
         }
     }
 
@@ -490,7 +584,7 @@ fn form_lines(
     let merge_h_tolerance = 0.1;
 
     let mut merged_items: Vec<ProjectedTextItem> = Vec::with_capacity(items.len());
-    for cur in items.drain(..) {
+    for mut cur in items.drain(..) {
         let should_merge = merged_items
             .last()
             .map(|prev| can_merge(prev, &cur, merge_y_tolerance, merge_h_tolerance))
@@ -500,6 +594,7 @@ fn form_lines(
             if let Some(prev) = merged_items.last_mut() {
                 let merged = merge_bbox(prev, &cur);
                 prev.item.text.push_str(&cur.item.text);
+                prev.item.words.append(&mut cur.item.words);
                 prev.item.x = merged.0;
                 prev.item.y = merged.1;
                 prev.item.width = merged.2;
@@ -552,7 +647,30 @@ fn form_lines(
             // Cap the line height to a reasonable multiple of median text height.
             let proposed_min_y = current_line_min_y.min(item.item.y);
             let proposed_max_y = current_line_max_y.max(item.item.y + item.item.height);
-            let too_tall = (proposed_max_y - proposed_min_y) > median_height * 1.8;
+            // too_tall threshold: prefer the smallest *trusted* item height
+            // already in the current line as the line-height baseline. PDFium
+            // reports inflated em-box heights for items with matrix-baked
+            // sizing (fs=1.0); using the global `median_height` then permits
+            // a real heading row to absorb the next visual row below it.
+            // Falls back to median_height when no smaller anchor is available.
+            let line_anchor_h = current_line
+                .iter()
+                .filter_map(|i| {
+                    if matches!(i.item.font_size, Some(fs) if fs > 1.5)
+                        || i.item.height < median_height
+                    {
+                        Some(i.item.height)
+                    } else {
+                        None
+                    }
+                })
+                .fold(f32::INFINITY, f32::min);
+            let too_tall_threshold = if line_anchor_h.is_finite() {
+                (line_anchor_h * 1.8).max(median_height * 0.6)
+            } else {
+                median_height * 1.8
+            };
+            let too_tall = (proposed_max_y - proposed_min_y) > too_tall_threshold;
 
             if !line_collide
                 && !margin_mismatch
@@ -594,11 +712,19 @@ fn form_lines(
         ay.total_cmp(&by)
     });
 
+    dump_lines("after_group", &lines);
+
     // merge 'words'
     const MERGE_THRESHOLD: f32 = 1.0;
 
     fn looks_like_table_number(text: &str) -> bool {
-        let trimmed = text.trim();
+        // Strip trailing statistical-significance markers ("0.77**", "0.31 *")
+        // so decorated correlation/p-value cells still count as numbers. Without
+        // this, the `both_are_numbers` guard below misfires and two adjacent
+        // stat cells get merged into one, destroying the table's column tracks.
+        let trimmed = text
+            .trim()
+            .trim_end_matches(|c: char| c == '*' || c == '†' || c == '‡' || c.is_whitespace());
         if trimmed.chars().count() < 2 {
             return false;
         }
@@ -635,7 +761,7 @@ fn form_lines(
 
     for line in lines.iter_mut() {
         let mut merged_line: Vec<ProjectedTextItem> = Vec::with_capacity(line.len());
-        for item in line.drain(..) {
+        for mut item in line.drain(..) {
             if let Some(prev) = merged_line.last_mut() {
                 let both_are_numbers = looks_like_table_number(&prev.item.text)
                     && looks_like_table_number(&item.item.text);
@@ -646,9 +772,65 @@ fn form_lines(
                 let y_diff = (item.item.y - prev.item.y).abs();
                 let y_compatible = y_diff <= 1.5;
 
-                if y_compatible && !both_are_numbers && delta_x <= MERGE_THRESHOLD {
+                // Decimal-fragment continuation: PDFium sometimes emits the
+                // fractional part of a number ("15.6", "200.4") as a separate,
+                // x-contiguous run beginning with the decimal point (".6").
+                // `both_are_numbers` below treats them as two distinct table
+                // values and keeps them apart, leaving "15 .6" in the rendered
+                // cell and injecting a spurious column track between them. A
+                // real pair of adjacent table numbers always has a visible
+                // inter-cell gap, never a digit butted directly against a
+                // leading-decimal run, so this is safe to join silently.
+                let is_decimal_continuation = y_compatible
+                    && (-2.0..=1.0).contains(&delta_x)
+                    && prev
+                        .item
+                        .text
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_ascii_digit())
+                    && {
+                        let mut cs = item.item.text.chars();
+                        cs.next() == Some('.') && cs.next().is_some_and(|c| c.is_ascii_digit())
+                    };
+                if is_decimal_continuation {
                     prev.item.width = item.item.x + item.item.width - prev.item.x;
                     prev.item.text.push_str(&item.item.text);
+                    prev.item.words.append(&mut item.item.words);
+                    merge_orig_bbox(prev, &item);
+                    continue;
+                }
+
+                // Word-boundary guard: when prev ends with an alphabetic
+                // character and item starts with one, a positive delta_x is
+                // very likely a missing-space gap (PDFium omitted the space
+                // glyph between two words), not a deliberate silent join.
+                // Silent-merging here fuses "of the" → "ofthe". Skip the
+                // silent path so the items stay separate and the line
+                // builder inserts a space based on `gap > space_threshold`.
+                // Punctuation joins (`Standards`+`.`, `width`+`)`, etc.)
+                // and overlapping/negative-gap merges still go through.
+                let alpha_alpha_gap = delta_x > 0.0
+                    && prev
+                        .item
+                        .text
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphabetic())
+                    && item
+                        .item
+                        .text
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphabetic());
+                if y_compatible
+                    && !both_are_numbers
+                    && !alpha_alpha_gap
+                    && delta_x <= MERGE_THRESHOLD
+                {
+                    prev.item.width = item.item.x + item.item.width - prev.item.x;
+                    prev.item.text.push_str(&item.item.text);
+                    prev.item.words.append(&mut item.item.words);
                     merge_orig_bbox(prev, &item);
                     continue;
                 }
@@ -661,6 +843,7 @@ fn form_lines(
                         prev.item.text.push(' ');
                     }
                     prev.item.text.push_str(&item.item.text);
+                    prev.item.words.append(&mut item.item.words);
                     merge_orig_bbox(prev, &item);
                     continue;
                 }
@@ -672,83 +855,101 @@ fn form_lines(
         *line = merged_line;
     }
 
-    // Merge overlapping lines when there is no horizontal bbox overlap.
-    let mut i = 1usize;
-    while i < lines.len() {
-        let (previous_min_y, previous_max_y) = {
-            let previous = &lines[i - 1];
-            let min_y = previous
-                .iter()
-                .map(|v| v.item.y)
-                .fold(f32::INFINITY, |a, b| a.min(b));
-            let max_y = previous
-                .iter()
-                .map(|v| v.item.y + v.item.height)
-                .fold(f32::NEG_INFINITY, |a, b| a.max(b));
-            (min_y, max_y)
-        };
+    // Merge overlapping lines when there is no horizontal bbox overlap,
+    // folding into an accumulator whose last line keeps absorbing successors.
+    // Ribbon pages reach 10⁵+ lines, so this must stay linear: the x-sort of
+    // a merged line is deferred until it stops absorbing (no check here
+    // depends on item order) and its y-range is maintained incrementally.
+    let y_range = |line: &[ProjectedTextItem]| -> (f32, f32) {
+        line.iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |acc, v| {
+                (acc.0.min(v.item.y), acc.1.max(v.item.y + v.item.height))
+            })
+    };
+    let mut merged: Vec<Vec<ProjectedTextItem>> = Vec::with_capacity(lines.len());
+    let mut prev_range = (f32::INFINITY, f32::NEG_INFINITY);
+    let mut prev_absorbed = false;
+    for mut current in lines {
+        let (current_min_y, current_max_y) = y_range(&current);
+        if let Some(previous) = merged.last_mut() {
+            let (previous_min_y, previous_max_y) = prev_range;
 
-        let (current_min_y, current_max_y) = {
-            let current = &lines[i];
-            let min_y = current
-                .iter()
-                .map(|v| v.item.y)
-                .fold(f32::INFINITY, |a, b| a.min(b));
-            let max_y = current
-                .iter()
-                .map(|v| v.item.y + v.item.height)
-                .fold(f32::NEG_INFINITY, |a, b| a.max(b));
-            (min_y, max_y)
-        };
+            // Do the two lines overlap vertically?
+            let lines_overlap = previous_max_y > current_min_y && previous_min_y < current_max_y;
 
-        // Do the two lines overlap vertically?
-        let lines_overlap = previous_max_y > current_min_y && previous_min_y < current_max_y;
-
-        if lines_overlap {
-            let bbox_overlap = {
-                let previous = &lines[i - 1];
-                let current = &lines[i];
-                current.iter().any(|bbox| {
+            if lines_overlap {
+                let bbox_overlap = current.iter().any(|bbox| {
                     previous.iter().any(|prev_bbox| {
                         (bbox.item.x >= prev_bbox.item.x
                             && bbox.item.x <= prev_bbox.item.x + prev_bbox.item.width)
                             || (prev_bbox.item.x >= bbox.item.x
                                 && prev_bbox.item.x <= bbox.item.x + bbox.item.width)
                     })
-                })
-            };
+                });
 
-            if !bbox_overlap {
-                let mut current = lines.remove(i);
-                lines[i - 1].append(&mut current);
-                lines[i - 1].sort_by(|a, b| a.item.x.total_cmp(&b.item.x));
-                continue;
+                if !bbox_overlap {
+                    if dbg_lines {
+                        let pj: String = previous
+                            .iter()
+                            .map(|x| x.item.text.trim())
+                            .collect::<Vec<_>>()
+                            .join("|");
+                        let cj: String = current
+                            .iter()
+                            .map(|x| x.item.text.trim())
+                            .collect::<Vec<_>>()
+                            .join("|");
+                        eprintln!(
+                            "[form_lines:overlap-merge] py={previous_min_y:.1}..{previous_max_y:.1} cy={current_min_y:.1}..{current_max_y:.1}\n    prev={pj:.60}\n    cur ={cj:.60}"
+                        );
+                    }
+                    previous.append(&mut current);
+                    prev_range = (
+                        previous_min_y.min(current_min_y),
+                        previous_max_y.max(current_max_y),
+                    );
+                    prev_absorbed = true;
+                    continue;
+                }
+            }
+            if prev_absorbed {
+                previous.sort_by(|a, b| a.item.x.total_cmp(&b.item.x));
             }
         }
-
-        i += 1;
+        merged.push(current);
+        prev_range = (current_min_y, current_max_y);
+        prev_absorbed = false;
     }
+    if prev_absorbed && let Some(previous) = merged.last_mut() {
+        previous.sort_by(|a, b| a.item.x.total_cmp(&b.item.x));
+    }
+    let lines = merged;
 
-    // Insert blank lines for vertical gaps between lines.
-    let mut i = 1;
-    while i < lines.len() {
-        let prev_metrics = representative_line_metrics(&lines[i - 1], median_height);
-        let cur_metrics = representative_line_metrics(&lines[i], median_height);
-        let y_delta = cur_metrics.0 - prev_metrics.1; // cur_top - prev_bottom
-        let reference_height = median_height.max(prev_metrics.2.min(cur_metrics.2));
+    dump_lines("after_overlap_merge", &lines);
 
-        if y_delta > reference_height {
-            let num_blank = ((y_delta / reference_height).round() as usize).saturating_sub(1);
-            let to_insert = num_blank.clamp(1, 10);
-            for _ in 0..to_insert {
-                lines.insert(i, Vec::new());
-                i += 1;
+    // Insert blank lines for vertical gaps between lines. Gaps are measured
+    // between consecutive content lines only; inserted blanks never
+    // participate.
+    let mut with_blanks: Vec<Vec<ProjectedTextItem>> = Vec::with_capacity(lines.len());
+    let mut prev_metrics: Option<(f32, f32, f32)> = None;
+    for line in lines {
+        let cur_metrics = representative_line_metrics(&line, median_height);
+        if let Some(prev_metrics) = prev_metrics {
+            let y_delta = cur_metrics.0 - prev_metrics.1; // cur_top - prev_bottom
+            let reference_height = median_height.max(prev_metrics.2.min(cur_metrics.2));
+
+            if y_delta > reference_height {
+                let num_blank = ((y_delta / reference_height).round() as usize).saturating_sub(1);
+                for _ in 0..num_blank.clamp(1, 10) {
+                    with_blanks.push(Vec::new());
+                }
             }
         }
-        i += 1;
+        prev_metrics = Some(cur_metrics);
+        with_blanks.push(line);
     }
 
-    lines
+    with_blanks
 }
 
 /// Returns (top, bottom, height) for representative items in a line,
@@ -925,8 +1126,12 @@ fn compress_wide_spaces(line: &str, min_run: usize, replace_with: usize) -> Stri
                 out.push_str(&" ".repeat(run_len));
             }
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b' ' {
+                i += 1;
+            }
+            // ASCII spaces are UTF-8 boundaries, so this preserves the original text.
+            out.push_str(&line[start..i]);
         }
     }
     out
@@ -1328,13 +1533,33 @@ fn render_line_as_flowing_text(
 
     let mut result = " ".repeat(indent);
 
+    // Median per-glyph advance across the line, used to bound the space
+    // threshold so tall display fonts don't get a threshold above their real
+    // word gaps. `+inf` (no bound) when the line has no measurable advances.
+    let adv_threshold = {
+        let mut advs: Vec<f32> = line
+            .iter()
+            .filter_map(|it| {
+                let n = it.item.text.chars().filter(|c| !c.is_whitespace()).count();
+                (n > 0 && it.item.width > 0.0).then(|| it.item.width / n as f32)
+            })
+            .collect();
+        if advs.is_empty() {
+            f32::INFINITY
+        } else {
+            advs.sort_by(f32::total_cmp);
+            advs[advs.len() / 2] * FLOWING_SPACE_ADV_RATIO
+        }
+    };
+
     for i in 0..line.len() {
         if i > 0 {
             let prev = &line[i - 1].item;
             let cur = &line[i].item;
             let gap = cur.x - (prev.x + prev.width);
-            let space_threshold =
-                (cur.height * FLOWING_SPACE_HEIGHT_RATIO).max(FLOWING_SPACE_MIN_THRESHOLD);
+            let space_threshold = (cur.height * FLOWING_SPACE_HEIGHT_RATIO)
+                .min(adv_threshold)
+                .max(FLOWING_SPACE_MIN_THRESHOLD);
             if gap > space_threshold && !result.ends_with(' ') {
                 result.push(' ');
             }
@@ -2704,11 +2929,13 @@ fn should_collapse_space_before_projected_punctuation(c: char) -> bool {
 }
 
 fn has_collapsible_content_before_punctuation(output: &str) -> bool {
-    output
-        .chars()
-        .rev()
-        .find(|c| *c != ' ')
-        .is_some_and(|c| c.is_alphanumeric() || !c.is_ascii_punctuation())
+    // A closing bracket or quote ends a token ("[1] .", "(see 2) ,"), so the
+    // space after it is the same spacing artifact as after a word.
+    output.chars().rev().find(|c| *c != ' ').is_some_and(|c| {
+        c.is_alphanumeric()
+            || !c.is_ascii_punctuation()
+            || matches!(c, ')' | ']' | '}' | '"' | '\'')
+    })
 }
 
 fn should_collapse_projected_domain_space_after_dot(
@@ -2835,11 +3062,42 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 .collect();
 
             let (projected_items, text) = project_to_grid(&page, projection_boxes);
+            // Detect figure regions from the page's vector graphics before
+            // XY-cut runs so the layout recursion can treat them as obstacles
+            // (partition the page around figures rather than slicing through).
+            let figures = crate::figure_cluster::detect_figure_rects(
+                &page.graphics,
+                &page.text_items,
+                page.page_width,
+                page.page_height,
+            );
+            // Pre-projection ruled-table detection. Feeds XY-cut as obstacles
+            // so a table's inter-column gaps don't get picked as page-level
+            // V-cuts (column-major reading order is the dominant TEDS=0
+            // failure mode on the bench: docs 083/120/130/etc.).
+            let table_rects = crate::markdown_layout::detect_table_rects(
+                &page.graphics,
+                page.page_width,
+                page.page_height,
+            );
+            let mut obstacles: Vec<Rect> = Vec::with_capacity(figures.len() + table_rects.len());
+            obstacles.extend(figures.iter().cloned());
+            obstacles.extend(table_rects.iter().cloned());
+            let (projected_lines, regions) = build_projected_lines(
+                &projected_items,
+                page.page_width,
+                page.page_height,
+                &obstacles,
+            );
+            let projected_item_frames = projected_item_frames(&projected_items);
             ParsedPage {
                 page_number: page.page_number,
+                page_label: page.page_label,
                 page_width: page.page_width,
                 page_height: page.page_height,
+                content_bounds: page.content_bounds,
                 text,
+                markdown: String::new(),
                 text_items: projected_items
                     .into_iter()
                     .map(|proj| TextItem {
@@ -2851,14 +3109,2294 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                         ..proj.item
                     })
                     .collect(),
+                projected_lines,
+                regions,
+                graphics: page.graphics,
+                vector_graphics: page.vector_graphics,
+                figures,
+                projected_item_frames,
+                struct_nodes: page.struct_nodes,
+                image_refs: page.image_refs,
+                complexity: None,
+                annotations: page.annotations,
+                form_fields: page.form_fields,
+                structure_tree: page.structure_tree,
+                // Filled in after classification, which needs the finished
+                // page (and whole-document signals) to run.
+                blocks: None,
             }
         })
         .collect()
 }
 
+/// `(projected, original)` rect per text item when rotation handling moved
+/// any item on the page (see `ParsedPage::projected_item_frames`); empty
+/// otherwise. Gated on the `rotated` flag rather than on coordinate drift:
+/// projection also rounds sizes and merges neighbours, and those small
+/// deltas are not the frame change block boxes need mapping through — so
+/// the common no-rotation page pays nothing and its boxes pass through
+/// untouched.
+fn projected_item_frames(items: &[ProjectedTextItem]) -> Vec<(Rect, Rect)> {
+    if !items.iter().any(|p| p.rotated) {
+        return Vec::new();
+    }
+    items
+        .iter()
+        .map(|p| {
+            (
+                Rect {
+                    x: p.item.x,
+                    y: p.item.y,
+                    width: p.item.width,
+                    height: p.item.height,
+                },
+                Rect {
+                    x: p.orig_x,
+                    y: p.orig_y,
+                    width: p.orig_width,
+                    height: p.orig_height,
+                },
+            )
+        })
+        .collect()
+}
+
+// ── ProjectedLine derivation ────────────────────────────────────────────────
+//
+// `build_projected_lines` groups already-projected items (in reading order)
+// into per-line structural metadata consumed by the markdown emitter. Lines
+// are grouped by y-proximity; aggregates (dominant font, all-bold/italic/mono)
+// are char-weighted across the line's items. The JSON/text outputs are
+// unaffected — `ParsedPage.projected_lines` is `#[serde(skip)]`.
+
+/// PDF font descriptor flag bits we care about.
+/// See PDF spec §9.8.2 (table 123).
+const PDF_FONT_FLAG_FIXED_PITCH: i32 = 1; // bit 1
+const PDF_FONT_FLAG_ITALIC: i32 = 64; // bit 7
+const PDF_FONT_FLAG_FORCE_BOLD: i32 = 262144; // bit 19
+
+/// Font-name substrings that indicate bold weight.
+const BOLD_NAME_HINTS: &[&str] = &["Bold", "Black", "Heavy", "Semibold", "Demibold"];
+/// Font-name substrings that indicate italic / oblique slant.
+const ITALIC_NAME_HINTS: &[&str] = &["Italic", "Oblique"];
+/// Font-name substrings that indicate a monospaced typeface.
+const MONO_NAME_HINTS: &[&str] = &[
+    "Courier",
+    "Mono",
+    "Consolas",
+    "Menlo",
+    "Source Code",
+    "Inconsolata",
+    "Hack",
+    "Fira Code",
+];
+
+fn name_contains_any(name: &str, hints: &[&str]) -> bool {
+    hints.iter().any(|h| name.contains(h))
+}
+
+pub(crate) fn is_bold_item(item: &TextItem) -> bool {
+    if let Some(flags) = item.font_flags
+        && flags & PDF_FONT_FLAG_FORCE_BOLD != 0
+    {
+        return true;
+    }
+    if let Some(w) = item.font_weight
+        && w >= 600
+    {
+        return true;
+    }
+    if let Some(n) = &item.font_name
+        && name_contains_any(n, BOLD_NAME_HINTS)
+    {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn is_italic_item(item: &TextItem) -> bool {
+    if let Some(flags) = item.font_flags
+        && flags & PDF_FONT_FLAG_ITALIC != 0
+    {
+        return true;
+    }
+    if let Some(n) = &item.font_name
+        && name_contains_any(n, ITALIC_NAME_HINTS)
+    {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn is_strike_item(item: &TextItem) -> bool {
+    item.strike
+}
+
+pub(crate) fn is_mono_item(item: &TextItem) -> bool {
+    if let Some(flags) = item.font_flags
+        && flags & PDF_FONT_FLAG_FIXED_PITCH != 0
+    {
+        return true;
+    }
+    if let Some(n) = &item.font_name
+        && name_contains_any(n, MONO_NAME_HINTS)
+    {
+        return true;
+    }
+    false
+}
+
+// ── XY-cut layout decomposition ─────────────────────────────────────────────
+//
+// Replaces the prior flat column detector. Recursively splits the page along H
+// or V axes at "valleys" — runs of low projection density wider than a minimum
+// threshold. Pre-order traversal of the resulting tree gives reading order
+// (top→bottom, left→right) including for nested layouts (banded splits with
+// sub-columns).
+//
+// Threshold is min-density relative to the local content's median: a cut is
+// valid if the projection density in the valley stays below T_DENS × median
+// for at least MIN_VALLEY_PT continuous units. Auto-scales to page content so
+// dense vs. sparse pages need no per-doc tuning. Conservative defaults — we'd
+// rather under-cut (merge columns) than shred a paragraph with wide
+// inter-word gaps.
+
+/// Bucket size for the 1D density projection (points).
+const XY_BUCKET_PT: f32 = 2.0;
+/// Upper bound on density-histogram buckets per axis; longer extents get wider
+/// buckets instead of a multi-GB histogram.
+const XY_MAX_BUCKETS: usize = 1 << 16;
+
+/// Bucket width for an axis of `length` points, capped at `XY_MAX_BUCKETS` buckets.
+fn xy_bucket_pt(length: f32) -> f32 {
+    XY_BUCKET_PT.max(length / XY_MAX_BUCKETS as f32)
+}
+/// Density threshold for a "valley", expressed as a fraction of the local
+/// median non-zero bucket density.
+const XY_T_DENS: f32 = 0.10;
+/// Minimum vertical-cut (column gutter) valley width.
+const XY_MIN_V_VALLEY_PT: f32 = 8.0;
+/// Minimum horizontal-cut (row gap) valley width, expressed as a multiple of
+/// the median line height.
+const XY_MIN_H_VALLEY_FACTOR: f32 = 1.4;
+/// Hard recursion cap.
+// Backstop only — every cut still passes the banner/density/histogram gates.
+// 6 starved pages with several stacked floats (tables + captions above a
+// 2-col body): each banner peel burns a level, and the body band leafs out
+// un-split at the cap.
+const XY_MAX_DEPTH: u32 = 12;
+/// Below this item count we stop trying to cut.
+const XY_MIN_ITEMS_TO_CUT: usize = 4;
+/// A horizontal cut must leave at least this many distinct text lines on each
+/// side; otherwise we don't slice prose into sliver bands.
+const XY_MIN_LINES_PER_H_SIDE: usize = 2;
+/// Vertical-cut score must beat the horizontal score by this factor to be
+/// chosen. Tie-breaks in favor of horizontal so pages are sliced into bands
+/// before columns — matches natural reading order.
+const XY_V_PREFERENCE_MARGIN: f32 = 1.1;
+
+/// Bucket width used by the column-start histogram fallback. 5pt is finer
+/// than typical inter-column gutters (8–20pt) and coarser than baseline
+/// noise / kerning drift, so column edges land in distinct buckets.
+const XY_COLUMN_BUCKET_PT: f32 = 5.0;
+/// Minimum lines stacked at the same left-edge cluster for the cluster to
+/// count as a column peak. A real column has many lines at one x (15+);
+/// indented paragraph-starts and footnote markers produce a handful (3–6).
+/// We set this above the typical "indented paragraph" count so those drop
+/// out and only true column-left edges remain.
+const XY_COLUMN_MIN_LINES_PER_PEAK: usize = 10;
+/// Minimum horizontal distance between two column peaks, as a fraction of
+/// `bbox.width`. Sub-paragraph indents and list nesting produce
+/// closely-spaced peaks; a real column gutter is much further out.
+const XY_COLUMN_MIN_GAP_FRACTION: f32 = 0.25;
+/// Minimum fraction of items that must start at one of the two detected
+/// column peaks. Real 2-column layouts cluster nearly every line at one of
+/// two left edges; tables, lists, and scattered prose don't.
+const XY_COLUMN_PEAK_DOMINANCE: f32 = 0.55;
+/// Minimum smaller/larger ratio between the two column peaks' line counts.
+/// Balanced 2-column layouts have ~equal line counts in each column; a
+/// 90/10 split is almost certainly a single column with one off-x bullet
+/// stack, not a real two-column structure.
+const XY_COLUMN_PEAK_BALANCE_RATIO: f32 = 0.4;
+/// Minimum per-column horizontal fill for an N-column (3+ peak) split.
+/// Genuine N-column prose fills each inter-peak slot nearly edge-to-edge
+/// with text; a data table leaves wide intra-row whitespace, so its cells
+/// cover only a fraction of each slot. Gate the N-column split on the
+/// least-filled column so we keep splitting prose but bail (→ table
+/// detector) on sparse tabular layouts.
+const XY_COLUMN_MIN_FILL: f32 = 0.55;
+
+/// A peak whose band count is below this fraction of the most-banded column's
+/// is treated as a figure-scatter "phantom" (axis tick labels, a point cloud
+/// spread across x) rather than a real column. Real table columns have one
+/// cell per row, so their band counts are comparable to their siblings; a
+/// plot embedded in 2-column prose contributes a sparse, low-fill third peak
+/// that would otherwise flip the whole region to `tabular` and suppress the
+/// genuine column split. See the phantom-drop in `xy_find_column_cut`.
+const XY_COLUMN_PHANTOM_BAND_FRACTION: f32 = 0.25;
+
+#[derive(Debug, Clone, Copy)]
+struct CutCandidate {
+    axis: CutAxis,
+    /// Coordinate of the split (y for horizontal cut, x for vertical).
+    position: f32,
+    score: f32,
+}
+
+/// Character-weighted contribution of an item to the projection. Headings get
+/// roughly the same weight as the body text they're competing with, instead of
+/// being amplified by their bbox area.
+fn xy_item_weight(it: &TextItem) -> f32 {
+    it.text.chars().count().max(1) as f32
+}
+
+fn xy_root_bbox(items: &[ProjectedTextItem], page_width: f32, page_height: f32) -> Rect {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for it in items {
+        if it.item.text.is_empty() {
+            continue;
+        }
+        min_x = min_x.min(it.item.x);
+        min_y = min_y.min(it.item.y);
+        max_x = max_x.max(it.item.x + it.item.width.max(0.0));
+        max_y = max_y.max(it.item.y + it.item.height.max(0.0));
+    }
+    if !min_x.is_finite() {
+        return Rect {
+            x: 0.0,
+            y: 0.0,
+            width: page_width.max(1.0),
+            height: page_height.max(1.0),
+        };
+    }
+    let x = min_x.max(0.0);
+    let y = min_y.max(0.0);
+    let w = (max_x - x).max(1.0);
+    let h = (max_y - y).max(1.0);
+    // Span the actual item extent. The page dimensions are only used as a
+    // fallback (no items). We must NOT clamp the bbox down to them:
+    // `handle_rotation_reading_order` lays rotated marginalia (e.g. an arXiv
+    // sidebar stamp) out on a virtual canvas taller/wider than the physical
+    // page and pushes the non-rotated body below it. Clamping to page_height
+    // would drop those displaced body items outside the density buckets, so no
+    // horizontal valley between a full-width header and the 2-column body is
+    // ever found and the column V-cut shreds the centered title/author band.
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
+}
+
+fn xy_median_line_height(items: &[ProjectedTextItem], idxs: &[usize]) -> f32 {
+    let mut heights: Vec<f32> = idxs
+        .iter()
+        .filter_map(|&i| {
+            let h = items[i].item.height;
+            if h > 0.5 { Some(h) } else { None }
+        })
+        .collect();
+    if heights.is_empty() {
+        return 10.0;
+    }
+    heights.sort_by(|a, b| a.total_cmp(b));
+    heights[heights.len() / 2]
+}
+
+/// Approximate distinct-line count by y-banding, used only to enforce
+/// `XY_MIN_LINES_PER_H_SIDE`.
+fn xy_distinct_lines(items: &[ProjectedTextItem], idxs: &[usize], median_h: f32) -> usize {
+    if idxs.is_empty() {
+        return 0;
+    }
+    let band = (median_h * 0.5).max(2.0);
+    let mut ys: Vec<f32> = idxs.iter().map(|&i| items[i].item.y).collect();
+    ys.sort_by(|a, b| a.total_cmp(b));
+    let mut lines = 1usize;
+    let mut last = ys[0];
+    for &y in &ys[1..] {
+        if (y - last).abs() > band {
+            lines += 1;
+            last = y;
+        }
+    }
+    lines
+}
+
+/// Find the best valley along `axis` inside `bbox` for the given items. The
+/// returned position is in absolute page coordinates.
+///
+/// `figures` is the set of figure-region rectangles on the page. Any figure
+/// that intersects `bbox` is stamped into the density projection like a giant
+/// opaque text block — its perpendicular extent (clipped to `bbox`) is added
+/// to each bucket it covers along `axis`. This makes the recursion prefer
+/// cuts *around* figures rather than slicing through them (which is the
+/// motivating fix for academic-paper page-1 layouts where a figure straddles
+/// both columns).
+fn xy_find_best_cut(
+    items: &[ProjectedTextItem],
+    idxs: &[usize],
+    bbox: &Rect,
+    axis: CutAxis,
+    median_h: f32,
+    figures: &[Rect],
+) -> Option<CutCandidate> {
+    let (origin, length) = match axis {
+        CutAxis::Horizontal => (bbox.y, bbox.height),
+        CutAxis::Vertical => (bbox.x, bbox.width),
+    };
+    if length <= 0.0 {
+        return None;
+    }
+    let bucket_pt = xy_bucket_pt(length);
+    let n_buckets = ((length / bucket_pt).ceil() as usize).max(1);
+    let mut density = vec![0.0f32; n_buckets];
+
+    for &i in idxs {
+        let it = &items[i].item;
+        let (c0, c1) = match axis {
+            CutAxis::Horizontal => (it.y, it.y + it.height.max(0.0)),
+            CutAxis::Vertical => (it.x, it.x + it.width.max(0.0)),
+        };
+        let weight = xy_item_weight(it);
+        let b0_f = ((c0 - origin) / bucket_pt).floor();
+        let b1_f = ((c1 - origin) / bucket_pt).ceil();
+        let b0 = b0_f.max(0.0) as usize;
+        let b1 = (b1_f.max(b0_f + 1.0) as usize).min(n_buckets);
+        for b in b0..b1 {
+            density[b] += weight;
+        }
+    }
+
+    // Stamp figures into the projection as opaque obstacles. A figure that
+    // intersects `bbox` adds density to each axis-parallel bucket it spans;
+    // weight = its perpendicular extent (clipped to bbox) so figures behave
+    // like very wide/tall pseudo-items relative to text. The valley search
+    // naturally finds cuts adjacent to figures rather than through them.
+    for fig in figures {
+        let fx0 = fig.x.max(bbox.x);
+        let fy0 = fig.y.max(bbox.y);
+        let fx1 = (fig.x + fig.width).min(bbox.x + bbox.width);
+        let fy1 = (fig.y + fig.height).min(bbox.y + bbox.height);
+        if fx1 <= fx0 || fy1 <= fy0 {
+            continue;
+        }
+        let (c0, c1, perp) = match axis {
+            CutAxis::Horizontal => (fy0, fy1, fx1 - fx0),
+            CutAxis::Vertical => (fx0, fx1, fy1 - fy0),
+        };
+        let weight = perp.max(1.0);
+        let b0_f = ((c0 - origin) / bucket_pt).floor();
+        let b1_f = ((c1 - origin) / bucket_pt).ceil();
+        let b0 = b0_f.max(0.0) as usize;
+        let b1 = (b1_f.max(b0_f + 1.0) as usize).min(n_buckets);
+        for b in b0..b1 {
+            density[b] += weight;
+        }
+    }
+
+    let mut nonzero: Vec<f32> = density.iter().copied().filter(|d| *d > 0.0).collect();
+    if nonzero.is_empty() {
+        return None;
+    }
+    nonzero.sort_by(|a, b| a.total_cmp(b));
+    let median = nonzero[nonzero.len() / 2];
+    if median <= 0.0 {
+        return None;
+    }
+    let threshold = median * XY_T_DENS;
+
+    // Don't cut at leading/trailing whitespace — only consider valleys interior
+    // to the content's span on this axis.
+    let first_dense = density.iter().position(|d| *d > threshold)?;
+    let last_dense = density.iter().rposition(|d| *d > threshold)?;
+    if last_dense <= first_dense + 1 {
+        return None;
+    }
+
+    let min_valley_pt = match axis {
+        CutAxis::Vertical => XY_MIN_V_VALLEY_PT,
+        CutAxis::Horizontal => median_h * XY_MIN_H_VALLEY_FACTOR,
+    };
+    let min_valley_buckets = ((min_valley_pt / bucket_pt).ceil() as usize).max(1);
+
+    let mut best: Option<CutCandidate> = None;
+    let mut i = first_dense + 1;
+    while i <= last_dense {
+        if density[i] <= threshold {
+            let s = i;
+            while i <= last_dense && density[i] <= threshold {
+                i += 1;
+            }
+            let e = i; // exclusive
+            let width = e - s;
+            if width >= min_valley_buckets {
+                let mean: f32 = density[s..e].iter().sum::<f32>() / width as f32;
+                let depth = (1.0 - mean / median).max(0.0);
+                let score = width as f32 * depth;
+                let mid = (s as f32 + e as f32) * 0.5;
+                let position = origin + mid * bucket_pt;
+                // Density-stamping alone isn't always enough to push the
+                // gutter inside a table region below threshold — the
+                // inter-cell gaps win on tables with sparsely-filled cells
+                // (docs 120/180/150). Hard-reject any cut line that passes
+                // strictly through an obstacle rect intersecting `bbox`.
+                if !cut_line_passes_through_obstacle(axis, position, bbox, figures)
+                    && best.as_ref().is_none_or(|b| score > b.score)
+                {
+                    best = Some(CutCandidate {
+                        axis,
+                        position,
+                        score,
+                    });
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+/// Hard-reject companion to the density-stamping in `xy_find_best_cut`.
+/// Density-stamping makes the recursion *prefer* cuts around obstacles, but
+/// sparsely-filled tables (docs 120/180/150) have inter-cell gaps that still
+/// score better than the stamped obstacle band. Returns true iff the cut
+/// line at `position` strictly passes through any obstacle that intersects
+/// `bbox`.
+fn cut_line_passes_through_obstacle(
+    axis: CutAxis,
+    position: f32,
+    bbox: &Rect,
+    obstacles: &[Rect],
+) -> bool {
+    // Tolerance: a cut whose position lands within ~1pt of an obstacle's
+    // edge is allowed (the obstacle's edge is itself a natural cut line).
+    const EDGE_TOLERANCE_PT: f32 = 1.0;
+    for ob in obstacles {
+        // Skip obstacles that don't intersect bbox at all.
+        let ox0 = ob.x.max(bbox.x);
+        let oy0 = ob.y.max(bbox.y);
+        let ox1 = (ob.x + ob.width).min(bbox.x + bbox.width);
+        let oy1 = (ob.y + ob.height).min(bbox.y + bbox.height);
+        if ox1 <= ox0 || oy1 <= oy0 {
+            continue;
+        }
+        let through = match axis {
+            CutAxis::Vertical => {
+                position > ox0 + EDGE_TOLERANCE_PT && position < ox1 - EDGE_TOLERANCE_PT
+            }
+            CutAxis::Horizontal => {
+                position > oy0 + EDGE_TOLERANCE_PT && position < oy1 - EDGE_TOLERANCE_PT
+            }
+        };
+        if through {
+            return true;
+        }
+    }
+    false
+}
+
+fn xy_split_bbox(bbox: &Rect, cut: &CutCandidate) -> (Rect, Rect) {
+    match cut.axis {
+        CutAxis::Horizontal => {
+            let top_h = (cut.position - bbox.y).max(0.0);
+            let top = Rect {
+                x: bbox.x,
+                y: bbox.y,
+                width: bbox.width,
+                height: top_h,
+            };
+            let bot = Rect {
+                x: bbox.x,
+                y: cut.position,
+                width: bbox.width,
+                height: (bbox.height - top_h).max(0.0),
+            };
+            (top, bot)
+        }
+        CutAxis::Vertical => {
+            let left_w = (cut.position - bbox.x).max(0.0);
+            let left = Rect {
+                x: bbox.x,
+                y: bbox.y,
+                width: left_w,
+                height: bbox.height,
+            };
+            let right = Rect {
+                x: cut.position,
+                y: bbox.y,
+                width: (bbox.width - left_w).max(0.0),
+                height: bbox.height,
+            };
+            (left, right)
+        }
+    }
+}
+
+/// Minimum fraction of region width a banner band must cover.
+const XY_BANNER_WIDTH_FRACTION: f32 = 0.6;
+/// Banner clearance gap above/below in multiples of median line height.
+const XY_BANNER_CLEARANCE_FACTOR: f32 = 1.5;
+
+/// Detect a "banner" y-band — one or more vertically-adjacent wide text bands
+/// (≥ `XY_BANNER_WIDTH_FRACTION` of bbox width) flanked by a clear vertical
+/// gap from the rest of the content. Returns an H-cut that isolates the banner
+/// from neighboring content.
+///
+/// Motivating case: a full-width centered title + authors block above a 2-
+/// column body where a figure straddles both columns. Density-based XY-cut
+/// can't separate them because the figure prevents any clean V-cut and there's
+/// no obvious H-valley between the banner and the body. The banner detector
+/// runs first and force-cuts just below the banner stack, freeing the
+/// recursion to find normal column gutters in the lower region.
+///
+/// Also helps mid-document section headings that span the full content width:
+/// a wide centered "5 Conclusion" line above a 2-column body would otherwise
+/// get pulled into one column.
+/// Fallback column-gutter detector for cases where the density-based V-cut
+/// search finds no valley — typically because a column-spanning element
+/// (wide heading, figure, table) fills the gutter at one y-band and inflates
+/// the projection at the gutter's x. Detects 2+ column structure by clustering
+/// the left edges of "narrow" lines (lines that don't span the full region
+/// width). When two clusters with ≥`XY_COLUMN_MIN_LINES_PER_PEAK` lines each
+/// are separated by ≥`XY_COLUMN_MIN_GAP_FRACTION × bbox.width`, returns a
+/// V-cut at the midpoint between them with a high score so it beats any
+/// density-based cut except banner.
+/// Per-column fill for a candidate peak set: per y-band covered x-span /
+/// slot width, averaged per column. Returns `(min_fill, band-count-weighted
+/// avg_fill)`, the same statistics as `xy_find_column_cut`'s main fill gate.
+/// `sorted` must be y-then-x sorted item indices; `peaks` left→right.
+fn xy_peak_fill_stats(
+    items: &[ProjectedTextItem],
+    sorted: &[usize],
+    peaks: &[(f32, usize)],
+    band_tol: f32,
+    bucket_pt: f32,
+    max_x: f32,
+) -> (f32, f32) {
+    let n = peaks.len();
+    let mut covered_sum = vec![0.0f32; n];
+    let mut band_count = vec![0usize; n];
+    let mut kk = 0;
+    while kk < sorted.len() {
+        let by = items[sorted[kk]].item.y;
+        let mut jj = kk;
+        while jj < sorted.len() && (items[sorted[jj]].item.y - by).abs() <= band_tol {
+            jj += 1;
+        }
+        let mut lo_x = vec![f32::INFINITY; n];
+        let mut hi_x = vec![f32::NEG_INFINITY; n];
+        for &idx in &sorted[kk..jj] {
+            let it = &items[idx].item;
+            if !it.x.is_finite() {
+                continue;
+            }
+            let mut c = 0;
+            while c + 1 < n && it.x >= peaks[c + 1].0 - bucket_pt {
+                c += 1;
+            }
+            lo_x[c] = lo_x[c].min(it.x);
+            hi_x[c] = hi_x[c].max(it.x + it.width.max(0.0));
+        }
+        for c in 0..n {
+            if hi_x[c] > lo_x[c] {
+                let col_w = if c + 1 < n {
+                    peaks[c + 1].0 - peaks[c].0
+                } else {
+                    max_x - peaks[c].0
+                };
+                if col_w > 1.0 {
+                    covered_sum[c] += ((hi_x[c] - lo_x[c]) / col_w).min(1.0);
+                    band_count[c] += 1;
+                }
+            }
+        }
+        kk = jj;
+    }
+    let mut min_fill = f32::INFINITY;
+    let mut weighted_sum = 0.0f32;
+    let mut weighted_n = 0.0f32;
+    for c in 0..n {
+        if band_count[c] > 0 {
+            let f = covered_sum[c] / band_count[c] as f32;
+            min_fill = min_fill.min(f);
+            weighted_sum += f * band_count[c] as f32;
+            weighted_n += band_count[c] as f32;
+        }
+    }
+    let avg_fill = if weighted_n > 0.0 {
+        weighted_sum / weighted_n
+    } else {
+        f32::INFINITY
+    };
+    (min_fill, avg_fill)
+}
+
+fn xy_find_column_cut(
+    items: &[ProjectedTextItem],
+    idxs: &[usize],
+    bbox: &Rect,
+    median_h: f32,
+    tabular: &mut bool,
+) -> Option<CutCandidate> {
+    let dbg = std::env::var("LITEPARSE_DEBUG_XY").is_ok();
+    macro_rules! reject {
+        ($($t:tt)*) => {{
+            if dbg { eprintln!("[xy col-reject] {}", format!($($t)*)); }
+            return None;
+        }};
+    }
+    if bbox.width <= 1.0 || idxs.len() < 8 {
+        reject!("preflight: width={:.1} items={}", bbox.width, idxs.len());
+    }
+
+    // Identify "line-start" items: within each y-band, the first item of
+    // each horizontal run is a line-start. PDFium routinely emits mid-line
+    // word-cluster fragments as separate items; counting all of them in
+    // the histogram denominator dilutes the column-dominance ratio so the
+    // wide-side probe never trips after a footer-peel H-cut. A 2-column
+    // line at the same baseline contributes TWO line-starts (one per
+    // column) because the inter-column gutter exceeds `gutter_gap`, so we
+    // don't collapse a band to its single leftmost item.
+    let band_tol = (median_h * 0.5).max(2.0);
+    let gutter_gap = median_h.max(4.0);
+
+    let mut sorted: Vec<usize> = idxs.to_vec();
+    sorted.sort_by(|&a, &b| {
+        items[a]
+            .item
+            .y
+            .total_cmp(&items[b].item.y)
+            .then(items[a].item.x.total_cmp(&items[b].item.x))
+    });
+
+    let mut line_starts: Vec<f32> = Vec::with_capacity(idxs.len() / 2);
+    // Items whose gap to the previous item falls just under `gutter_gap` but
+    // clearly above word-gap range. A tight column gutter (e.g. ~9pt at
+    // median_h=10) fails the strict test on justified lines whose left column
+    // runs right up to the gutter; these get a second chance below if their x
+    // aligns with a column peak that has strict evidence.
+    let mut near_starts: Vec<f32> = Vec::new();
+    let near_gap_floor = gutter_gap * 0.6;
+    let mut k = 0;
+    while k < sorted.len() {
+        let band_y = items[sorted[k]].item.y;
+        let mut j = k;
+        while j < sorted.len() && (items[sorted[j]].item.y - band_y).abs() <= band_tol {
+            j += 1;
+        }
+        let mut band_items: Vec<usize> = sorted[k..j].to_vec();
+        band_items.sort_by(|&a, &b| items[a].item.x.total_cmp(&items[b].item.x));
+        let mut prev_right = f32::NEG_INFINITY;
+        for &idx in &band_items {
+            let it = &items[idx].item;
+            if it.x.is_finite() {
+                let gap = it.x - prev_right;
+                if gap > gutter_gap {
+                    line_starts.push(it.x);
+                } else if gap > near_gap_floor {
+                    near_starts.push(it.x);
+                }
+            }
+            let right = it.x + it.width.max(0.0);
+            if right > prev_right {
+                prev_right = right;
+            }
+        }
+        k = j;
+    }
+
+    if line_starts.len() < 8 {
+        reject!(
+            "line_starts={} < 8 (items={})",
+            line_starts.len(),
+            idxs.len()
+        );
+    }
+
+    // Histogram extent uses full item bounds so `XY_COLUMN_MIN_GAP_FRACTION`
+    // calibration (fraction of layout width) is preserved. Only line-starts
+    // contribute to the bucket counts and the dominance denominator.
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    for &i in idxs {
+        let it = &items[i].item;
+        if it.x.is_finite() {
+            min_x = min_x.min(it.x);
+            max_x = max_x.max(it.x + it.width.max(0.0));
+        }
+    }
+    if !min_x.is_finite() || max_x <= min_x + 1.0 {
+        reject!("degenerate extent min_x={min_x:.1} max_x={max_x:.1}");
+    }
+    let total_w = max_x - min_x;
+    let bucket_pt = XY_COLUMN_BUCKET_PT;
+    let n_buckets = ((total_w / bucket_pt).ceil() as usize).max(1);
+    let mut hist = vec![0usize; n_buckets];
+    for &x in &line_starts {
+        let b_f = ((x - min_x) / bucket_pt).floor();
+        let b = b_f.max(0.0) as usize;
+        if b < n_buckets {
+            hist[b] += 1;
+        }
+    }
+
+    // Peak-aligned rescue for tight gutters: a near-gap start only counts
+    // when it lands at (nearly) the same x as existing strict-evidence
+    // starts. A column left edge aligns to sub-point precision across
+    // bands; word-gap "rivers" in justified text jitter by several points —
+    // a looser bucket-width match here let rivers stack onto stray strict
+    // starts and manufacture a fake second column inside narrow justified
+    // prose. Require near-exact agreement with at least 2 strict starts.
+    let mut rescued = 0usize;
+    let mut counted_starts: Vec<f32> = line_starts.clone();
+    if !near_starts.is_empty() {
+        const RESCUE_ALIGN_TOL_PT: f32 = 1.5;
+        for &x in &near_starts {
+            let support = line_starts
+                .iter()
+                .filter(|&&s| (s - x).abs() <= RESCUE_ALIGN_TOL_PT)
+                .count();
+            if support >= 2 {
+                let b = (((x - min_x) / bucket_pt).floor()).max(0.0) as usize;
+                if b < n_buckets {
+                    hist[b] += 1;
+                    rescued += 1;
+                    counted_starts.push(x);
+                }
+            }
+        }
+        if dbg && rescued > 0 {
+            eprintln!(
+                "[xy col-rescue] {rescued} near-gap starts (gap in [{near_gap_floor:.1},{gutter_gap:.1}]) exactly aligned to >=2 strict starts"
+            );
+        }
+    }
+    let n_starts = line_starts.len() + rescued;
+
+    // Cluster adjacent occupied buckets into peaks. A peak is a contiguous
+    // run of buckets with ≥1 count, merged through gaps of ≤2 zero buckets
+    // (~10pt) to absorb slight intra-column drift.
+    let mut peaks: Vec<(f32, usize)> = Vec::new(); // (x_center, item_count)
+    let mut i = 0;
+    while i < n_buckets {
+        if hist[i] == 0 {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        let mut total = 0usize;
+        let mut last_nonzero = i;
+        let mut j = i;
+        while j < n_buckets {
+            if hist[j] > 0 {
+                total += hist[j];
+                last_nonzero = j;
+                j += 1;
+            } else if j - last_nonzero <= 2 {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        let x_center = min_x + bucket_pt * (s as f32 + last_nonzero as f32 + 1.0) * 0.5;
+        peaks.push((x_center, total));
+        i = j;
+    }
+
+    // Keep only "strong" peaks. A real column edge is sat-stacked by many
+    // lines at the same left x; spurious peaks (a stray indented quote, a
+    // numbered marker, etc.) carry only a few lines.
+    let strong_before = peaks.len();
+    let raw_counts: Vec<(f32, usize)> = peaks.clone();
+    // Adaptive minimum: scale with how many line-starts the band actually has.
+    // The static `XY_COLUMN_MIN_LINES_PER_PEAK = 10` floor is meant to drop
+    // indented-paragraph false peaks (a handful of lines) on a large region,
+    // but on smaller regions it can drop legitimate column peaks too. For a
+    // body region with ~36 lines split across 2 columns, each peak only
+    // carries 5–6 line-starts after the histogram spreads them across the
+    // page width — well under 10. Use `max(line_starts / 6, 4)`: still rules
+    // out the tiny indent peaks, but a 2-column region with ~5 lines/peak
+    // qualifies. Capped by `XY_COLUMN_MIN_LINES_PER_PEAK` so large regions
+    // keep the stricter floor.
+    let adaptive_min = (n_starts / 6).clamp(4, XY_COLUMN_MIN_LINES_PER_PEAK);
+    peaks.retain(|(_, c)| *c >= adaptive_min);
+    if peaks.len() < 2 {
+        // A table with a sparse row drops most peaks just under
+        // `adaptive_min`, so the fill gate below never runs and density
+        // V-cuts are free to slice the table's cell gutters (transposing it
+        // column-major). 3+ balanced, dominant, low-fill raw peaks are still
+        // tabular evidence — classify only, never cut.
+        if raw_counts.len() >= 3 {
+            let raw_sum: usize = raw_counts.iter().map(|(_, c)| *c).sum();
+            let raw_min = raw_counts.iter().map(|(_, c)| *c).min().unwrap_or(0);
+            let raw_max = raw_counts.iter().map(|(_, c)| *c).max().unwrap_or(0);
+            let balanced = raw_max > 0
+                && raw_min >= 2
+                && raw_min as f32 / raw_max as f32 >= XY_COLUMN_PEAK_BALANCE_RATIO;
+            let dominance = raw_sum as f32 / n_starts.max(1) as f32;
+            if balanced && dominance >= XY_COLUMN_PEAK_DOMINANCE {
+                // The low-fill requirement is load-bearing: N-column prose
+                // whose short columns fell under `adaptive_min` (newspaper
+                // pages, multi-column TOCs) matches the peak shape but fills
+                // its slots nearly edge-to-edge.
+                let mut raw_peaks = raw_counts.clone();
+                raw_peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let (min_fill, avg_fill) =
+                    xy_peak_fill_stats(items, &sorted, &raw_peaks, band_tol, bucket_pt, max_x);
+                let sparse = (min_fill.is_finite() && min_fill < 0.38)
+                    || (avg_fill.is_finite() && avg_fill < XY_COLUMN_MIN_FILL);
+                if sparse {
+                    *tabular = true;
+                }
+                if dbg {
+                    eprintln!(
+                        "[xy col-weak-peaks] {} balanced raw peaks (min={raw_min} max={raw_max}) dominance={dominance:.2} min_fill={min_fill:.2} avg_fill={avg_fill:.2} — {}",
+                        raw_counts.len(),
+                        if sparse {
+                            "tabular, no cut"
+                        } else {
+                            "filled (prose), not tabular"
+                        }
+                    );
+                }
+            }
+        }
+        if dbg {
+            let preview: Vec<String> = raw_counts
+                .iter()
+                .take(8)
+                .map(|(x, c)| format!("({x:.0}:{c})"))
+                .collect();
+            eprintln!(
+                "[xy col-reject] peaks<2 after min_per_peak={adaptive_min} (raw={strong_before} strong={}): {}",
+                peaks.len(),
+                preview.join(",")
+            );
+        }
+        return None;
+    }
+    peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    // Tabular layouts produce 3+ strong peaks (one per cell column). Real
+    // page columns have exactly 2 dominant peaks (left edge of col 1, left
+    // edge of col 2) — even multi-paragraph indents are sub-peaks weak
+    // enough to drop out under the min_per_peak filter. Bail when we see
+    // more than 2 strong peaks so we don't slice tables.
+    // Tabular layouts produce 3+ strong peaks with comparable counts. But a
+    // real 2-column page can also produce 3+ peaks when a centered float
+    // (caption, sub-heading stack, pull-quote) sits between the columns and
+    // contributes line-starts at a mid x. Distinguish: if the top-2 peaks
+    // by count dominate the remainder, keep them and drop the rest;
+    // otherwise (top-3 are comparable → tabular) bail.
+    if peaks.len() > 2 {
+        let mut by_count = peaks.clone();
+        by_count.sort_by(|a, b| b.1.cmp(&a.1));
+        let third = by_count[2].1 as f32;
+        let second = by_count[1].1 as f32;
+        let largest = by_count[0].1 as f32;
+        if second <= 0.0 || third / second >= XY_COLUMN_PEAK_BALANCE_RATIO {
+            // 3+ comparable peaks. Two shapes produce this: a genuine
+            // N-column prose layout (newspaper / magazine / multi-col
+            // reference list) or a data table. We can't bail on both —
+            // bailing leaves N-column prose joined line-by-line, which the
+            // borderless table detector then shreds into a fake table.
+            // Keep every peak balanced against the largest and let the
+            // gap logic cut the leftmost gutter; recursion re-runs on each
+            // side and peels the remaining columns one at a time. The
+            // downstream dominance + min-gap guards still reject tables
+            // whose cells don't tightly left-cluster (numeric columns are
+            // typically right-aligned / centered, so they never form
+            // strong left-edge peaks and fail dominance here).
+            let before = peaks.len();
+            peaks.retain(|(_, c)| {
+                largest <= 0.0 || (*c as f32) / largest >= XY_COLUMN_PEAK_BALANCE_RATIO
+            });
+            if peaks.len() < 2 {
+                reject!("peaks>2 but <2 balanced (largest={largest})");
+            }
+            if dbg {
+                eprintln!(
+                    "[xy col-keep-N] kept {} of {} balanced peaks (N-column); xs=[{}]",
+                    peaks.len(),
+                    before,
+                    peaks
+                        .iter()
+                        .map(|(x, c)| format!("{x:.0}:{c}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        } else {
+            // Top-2 dominate → assume real columns + weak floats. Keep
+            // top-2 (re-sorted left→right) and continue.
+            let mut top2 = vec![by_count[0], by_count[1]];
+            top2.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if dbg {
+                eprintln!(
+                    "[xy col-keep-top2] dropped {} weak peaks; kept xs=[{:.0}:{},{:.0}:{}]",
+                    peaks.len() - 2,
+                    top2[0].0,
+                    top2[0].1,
+                    top2[1].0,
+                    top2[1].1
+                );
+            }
+            peaks = top2;
+        }
+    }
+    // Fill-density gate: prose columns fill each inter-peak slot nearly
+    // edge-to-edge; table cells leave wide whitespace. Applies to ALL peak
+    // counts including 2 — a 2-col label/value table (description list)
+    // produces the same two left-edge peaks as 2-col prose, and slicing it
+    // strands each half in its own leaf where no table detector can see
+    // the rows whole. Per band, measure each column's covered span / slot
+    // width; if too sparse, treat as a table and bail.
+    {
+        let mut n = peaks.len();
+        let mut covered_sum = vec![0.0f32; n];
+        let mut band_count = vec![0usize; n];
+        let mut kk = 0;
+        while kk < sorted.len() {
+            let by = items[sorted[kk]].item.y;
+            let mut jj = kk;
+            while jj < sorted.len() && (items[sorted[jj]].item.y - by).abs() <= band_tol {
+                jj += 1;
+            }
+            let mut lo_x = vec![f32::INFINITY; n];
+            let mut hi_x = vec![f32::NEG_INFINITY; n];
+            for &idx in &sorted[kk..jj] {
+                let it = &items[idx].item;
+                if !it.x.is_finite() {
+                    continue;
+                }
+                // Peak centers are bucket-quantized, so a column's items can
+                // start up to a bucket left of its peak center; without the
+                // slack they all bin into the previous slot and that column
+                // reads as empty (its sparse cells never get fill-checked).
+                let mut c = 0;
+                while c + 1 < n && it.x >= peaks[c + 1].0 - bucket_pt {
+                    c += 1;
+                }
+                lo_x[c] = lo_x[c].min(it.x);
+                hi_x[c] = hi_x[c].max(it.x + it.width.max(0.0));
+            }
+            for c in 0..n {
+                if hi_x[c] > lo_x[c] {
+                    let col_w = if c + 1 < n {
+                        peaks[c + 1].0 - peaks[c].0
+                    } else {
+                        max_x - peaks[c].0
+                    };
+                    if col_w > 1.0 {
+                        covered_sum[c] += ((hi_x[c] - lo_x[c]) / col_w).min(1.0);
+                        band_count[c] += 1;
+                    }
+                }
+            }
+            kk = jj;
+        }
+        // Two-part gate that distinguishes prose columns from tables:
+        //
+        //   1. min_fill floor (MIN_FILL_HARD_FLOOR = 0.38) — rejects
+        //      pages where any column has narrow text in many bands
+        //      (e.g. table with numeric column). Real tables have
+        //      at least one column with fill ≤ 0.36.
+        //   2. Band-count-weighted avg_fill ≥ XY_COLUMN_MIN_FILL —
+        //      catches table layouts where ALL columns are uniformly
+        //      narrow (no column dominates the weighted average).
+        //
+        // Both must pass. The min-only gate was too brittle: a real
+        // 3-column prose page with one page-bottom column having ~4
+        // bands of short text dragged the min below 0.55 even though
+        // every meaningful column was clearly prose. The avg-only
+        // gate let through tables where the narrow column had enough
+        // bands to be informative but its weight was diluted by
+        // wider neighboring columns.
+        let mut min_fill = f32::INFINITY;
+        let mut weighted_sum = 0.0f32;
+        let mut weighted_n = 0.0f32;
+        let mut per_col_fill: Vec<f32> = Vec::with_capacity(n);
+        for c in 0..n {
+            if band_count[c] > 0 {
+                let f = covered_sum[c] / band_count[c] as f32;
+                per_col_fill.push(f);
+                min_fill = min_fill.min(f);
+                weighted_sum += f * band_count[c] as f32;
+                weighted_n += band_count[c] as f32;
+            }
+        }
+        let mut avg_fill = if weighted_n > 0.0 {
+            weighted_sum / weighted_n
+        } else {
+            f32::INFINITY
+        };
+        if dbg {
+            eprintln!(
+                "[xy col-fill] avg_fill={avg_fill:.2} min_fill={min_fill:.2} (gate={XY_COLUMN_MIN_FILL}) per_col=[{}] band_counts=[{}]",
+                per_col_fill
+                    .iter()
+                    .map(|f| format!("{f:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                band_count
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        const MIN_FILL_HARD_FLOOR: f32 = 0.38;
+        // Figure-scatter phantom column: on a 2-column page with an embedded
+        // plot (scatter cloud, axis tick labels), the plot's x-spread items
+        // form a third peak that is BOTH sparsely-banded (far fewer text rows
+        // than the real columns) and low-fill. Left in, it drags min_fill
+        // under the floor and flips the whole region to `tabular`, suppressing
+        // the genuine column split. A real narrow table column instead has a
+        // band count comparable to its siblings (one cell per row), so the
+        // band-count ratio cleanly separates the two. Drop phantom peaks when
+        // ≥2 well-filled columns survive, then re-run the gate on them.
+        if n > 2 && std::env::var("LITEPARSE_DISABLE_PHANTOM_COL_DROP").is_err() {
+            let max_bands = band_count.iter().copied().max().unwrap_or(0);
+            if max_bands > 0 {
+                let band_floor =
+                    (max_bands as f32 * XY_COLUMN_PHANTOM_BAND_FRACTION).ceil() as usize;
+                let col_fill = |c: usize| -> f32 {
+                    if band_count[c] > 0 {
+                        covered_sum[c] / band_count[c] as f32
+                    } else {
+                        0.0
+                    }
+                };
+                let survivors: Vec<usize> = (0..n)
+                    .filter(|&c| !(band_count[c] < band_floor && col_fill(c) < MIN_FILL_HARD_FLOOR))
+                    .collect();
+                let survivors_filled = survivors
+                    .iter()
+                    .all(|&c| col_fill(c) >= MIN_FILL_HARD_FLOOR);
+                if survivors.len() >= 2 && survivors.len() < n && survivors_filled {
+                    let kept: Vec<(f32, usize)> = survivors.iter().map(|&c| peaks[c]).collect();
+                    let mut new_min = f32::INFINITY;
+                    let mut wsum = 0.0f32;
+                    let mut wn = 0.0f32;
+                    for &c in &survivors {
+                        let f = col_fill(c);
+                        new_min = new_min.min(f);
+                        wsum += f * band_count[c] as f32;
+                        wn += band_count[c] as f32;
+                    }
+                    if dbg {
+                        eprintln!(
+                            "[xy col-phantom] dropped {} sparse low-fill peak(s) (band_floor={band_floor}); kept xs=[{}]",
+                            n - survivors.len(),
+                            kept.iter()
+                                .map(|(x, _)| format!("{x:.0}"))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        );
+                    }
+                    peaks = kept;
+                    n = peaks.len();
+                    min_fill = new_min;
+                    avg_fill = if wn > 0.0 { wsum / wn } else { f32::INFINITY };
+                }
+            }
+        }
+        // The min-floor catches ≥3-col tables whose narrow numeric column is
+        // diluted out of the weighted average by wide neighbors. With only 2
+        // columns no dilution is possible — a sparse column of two drags the
+        // average itself — and a short second prose column (a page-bottom
+        // column with a few bands) would false-positive here, suppressing a
+        // needed column split AND the density V via the tabular flag.
+        if n > 2 && min_fill.is_finite() && min_fill < MIN_FILL_HARD_FLOOR {
+            *tabular = true;
+            reject!("N-column min fill {min_fill:.2} < {MIN_FILL_HARD_FLOOR} (tabular column)");
+        }
+        if avg_fill.is_finite() && avg_fill < XY_COLUMN_MIN_FILL {
+            *tabular = true;
+            reject!(
+                "N-column avg fill {avg_fill:.2} < {} (tabular)",
+                XY_COLUMN_MIN_FILL
+            );
+        }
+    }
+    // Require the two peaks to together dominate the histogram — a real
+    // 2-column layout has the great majority of items starting at one of
+    // the two column-left edges. Tables, lists, and prose with scattered
+    // indents distribute their item-starts across many x's and won't pass.
+    let peak_sum: usize = peaks.iter().map(|(_, c)| *c).sum();
+    let dominance = (peak_sum as f32) / (n_starts as f32);
+    if dominance < XY_COLUMN_PEAK_DOMINANCE {
+        reject!(
+            "dominance {dominance:.2} < {} (peak_sum={peak_sum} line_starts={n_starts})",
+            XY_COLUMN_PEAK_DOMINANCE
+        );
+    }
+    // Require the peaks to be roughly balanced in size. A real multi-column
+    // layout has comparable line counts in each column; a long-single-column
+    // page that happens to have one bullet stack at a different x produces
+    // a tall + tiny peak pair that should not trigger a column split. Check
+    // the global min/max across all kept peaks so an N-column layout with one
+    // short column is also rejected.
+    let smallest = peaks.iter().map(|(_, c)| *c).min().unwrap() as f32;
+    let largest = peaks.iter().map(|(_, c)| *c).max().unwrap() as f32;
+    let balance = if largest > 0.0 {
+        smallest / largest
+    } else {
+        0.0
+    };
+    if balance < XY_COLUMN_PEAK_BALANCE_RATIO {
+        reject!(
+            "balance {balance:.2} < {} (min={smallest} max={largest} npeaks={})",
+            XY_COLUMN_PEAK_BALANCE_RATIO,
+            peaks.len()
+        );
+    }
+
+    // Cut at the leftmost gutter that clears `XY_COLUMN_MIN_GAP_FRACTION ×
+    // total_w` (list-item / block-quote indents produce closely spaced peaks;
+    // a real column gutter is much further apart). For a 2-column layout this
+    // is the only gap. For N columns, peeling the leftmost column first and
+    // letting the recursion re-run on the remainder splits the rest one
+    // gutter at a time.
+    let min_gap = total_w * XY_COLUMN_MIN_GAP_FRACTION;
+    let mut best: Option<(f32, usize)> = None;
+    for w_idx in 0..peaks.len() - 1 {
+        let gap = peaks[w_idx + 1].0 - peaks[w_idx].0;
+        if gap >= min_gap {
+            best = Some((gap, w_idx));
+            break;
+        }
+    }
+    let li = match best {
+        Some((_, li)) => li,
+        None => reject!(
+            "no gap >= {:.0} (min_gap_frac={} total_w={total_w:.0}); peak_xs=[{:.0},{:.0}] gap={:.0}",
+            min_gap,
+            XY_COLUMN_MIN_GAP_FRACTION,
+            peaks[0].0,
+            peaks[1].0,
+            peaks[1].0 - peaks[0].0
+        ),
+    };
+    // Place the cut at the actual gutter, not midway between peak centers.
+    // Peaks mark column LEFT edges, so the center midpoint lands inside the
+    // left column's text span and misroutes its mid-line items under
+    // partition_by_item. The gutter spans from the rightmost left-side item
+    // extent to the right column's leftmost counted start — NOT the peak
+    // center: a right-aligned numeric column scatters its starts left of
+    // the bucket-quantized center, and a cut placed at the center would
+    // route those values into the left column.
+    let mid_centers = (peaks[li].0 + peaks[li + 1].0) * 0.5;
+    let right_min_start = counted_starts
+        .iter()
+        .copied()
+        .filter(|&x| x > mid_centers)
+        .fold(f32::INFINITY, f32::min);
+    let boundary = if right_min_start.is_finite() {
+        right_min_start
+    } else {
+        peaks[li + 1].0
+    };
+    let mut gutter_left = f32::NEG_INFINITY;
+    for &i in idxs {
+        let it = &items[i].item;
+        if it.x.is_finite() {
+            let r = it.x + it.width.max(0.0);
+            if r <= boundary - 1.0 && r > gutter_left {
+                gutter_left = r;
+            }
+        }
+    }
+    let cut_x = if gutter_left.is_finite() && gutter_left > peaks[li].0 {
+        (gutter_left + boundary) * 0.5
+    } else {
+        mid_centers
+    };
+    // Validate cut lands inside the bbox; if bbox-clamping moved the bbox
+    // off the items (some PDFs have content with negative x), fall back to
+    // an item-relative midpoint check.
+    if cut_x <= min_x + 1.0 || cut_x >= max_x - 1.0 {
+        reject!("cut_x {cut_x:.0} outside extent [{min_x:.0},{max_x:.0}]");
+    }
+    // High finite score so this beats every density cut but stays below
+    // banner's infinity.
+    Some(CutCandidate {
+        axis: CutAxis::Vertical,
+        position: cut_x,
+        score: 1.0e9,
+    })
+}
+
+/// X position of the vertical gutter that splits `idxs` (within `bbox`) into
+/// columns — from the density V-cut or the column-start histogram fallback.
+/// `None` when the region is single-column. Used to decide whether peeling a
+/// wide spanning line above this region is productive.
+fn column_cut_x(
+    items: &[ProjectedTextItem],
+    idxs: &[usize],
+    bbox: &Rect,
+    median_h: f32,
+    figures: &[Rect],
+) -> Option<f32> {
+    xy_find_best_cut(items, idxs, bbox, CutAxis::Vertical, median_h, figures)
+        .or_else(|| {
+            let mut tabular = false;
+            xy_find_column_cut(items, idxs, bbox, median_h, &mut tabular)
+        })
+        .map(|c| c.position)
+}
+
+/// Union horizontal extent (min x, max x) of `idxs`.
+fn x_extent(items: &[ProjectedTextItem], idxs: &[usize]) -> (f32, f32) {
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for &i in idxs {
+        let it = &items[i].item;
+        lo = lo.min(it.x);
+        hi = hi.max(it.x + it.width.max(0.0));
+    }
+    (lo, hi)
+}
+
+fn xy_find_banner_cut(
+    items: &[ProjectedTextItem],
+    idxs: &[usize],
+    bbox: &Rect,
+    median_h: f32,
+) -> Option<CutCandidate> {
+    if bbox.width <= 1.0 || idxs.len() < 2 {
+        return None;
+    }
+    let mut sorted: Vec<usize> = idxs.to_vec();
+    sorted.sort_by(|&a, &b| items[a].item.y.total_cmp(&items[b].item.y));
+    let band_tol = (median_h * 0.5).max(2.0);
+    let min_clearance = (median_h * XY_BANNER_CLEARANCE_FACTOR).max(8.0);
+    let width_threshold = XY_BANNER_WIDTH_FRACTION * bbox.width;
+
+    // Group items into y-bands. A new item joins the current band when its top
+    // is within `band_tol` of either the band's center or its existing bottom
+    // (handles slight baseline variation).
+    let mut bands: Vec<(f32, f32, f32, f32)> = Vec::new(); // (y_min, y_max, x_min, x_max)
+    for &i in &sorted {
+        let it = &items[i].item;
+        let y0 = it.y;
+        let y1 = it.y + it.height.max(0.0);
+        let x0 = it.x;
+        let x1 = it.x + it.width.max(0.0);
+        let mut merged = false;
+        if let Some(last) = bands.last_mut() {
+            let center = (last.0 + last.1) * 0.5;
+            if (y0 - center).abs() <= band_tol || y0 <= last.1 + band_tol {
+                last.0 = last.0.min(y0);
+                last.1 = last.1.max(y1);
+                last.2 = last.2.min(x0);
+                last.3 = last.3.max(x1);
+                merged = true;
+            }
+        }
+        if !merged {
+            bands.push((y0, y1, x0, x1));
+        }
+    }
+    if bands.is_empty() {
+        return None;
+    }
+    let is_wide = |b: &(f32, f32, f32, f32)| -> bool { (b.3 - b.2) >= width_threshold };
+
+    // Walk top→bottom. For each run of consecutive wide bands (close enough to
+    // each other to count as a single banner stack), check above/below clearance
+    // and emit a cut if isolated.
+    let mut i = 0;
+    while i < bands.len() {
+        if !is_wide(&bands[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        // Extend through consecutive wide bands separated by less than the
+        // clearance threshold — multi-line title + authors counts as one
+        // banner stack.
+        while end + 1 < bands.len()
+            && is_wide(&bands[end + 1])
+            && bands[end + 1].0 - bands[end].1 < min_clearance
+        {
+            end += 1;
+        }
+        let banner_top = bands[start].0;
+        let banner_bot = bands[end].1;
+        let above_y = if start > 0 {
+            Some(bands[start - 1].1)
+        } else {
+            None
+        };
+        let below_y = if end + 1 < bands.len() {
+            Some(bands[end + 1].0)
+        } else {
+            None
+        };
+        let above_clear = above_y.is_none_or(|ay| banner_top - ay >= min_clearance);
+        let below_clear = below_y.is_none_or(|by| by - banner_bot >= min_clearance);
+
+        if above_clear && below_clear {
+            // Prefer cutting BELOW the banner so it becomes the top region of
+            // the split (matches natural reading order). Fall back to cutting
+            // above only when there's nothing below to cut against.
+            let cut_y = if let Some(by) = below_y {
+                (banner_bot + by) * 0.5
+            } else if let Some(ay) = above_y {
+                (ay + banner_top) * 0.5
+            } else {
+                // Banner spans the whole region — no productive cut.
+                i = end + 1;
+                continue;
+            };
+            // Skip degenerate cuts that would leave one side empty.
+            if cut_y > bbox.y + 1.0 && cut_y < bbox.y + bbox.height - 1.0 {
+                return Some(CutCandidate {
+                    axis: CutAxis::Horizontal,
+                    position: cut_y,
+                    score: f32::INFINITY,
+                });
+            }
+        }
+        i = end + 1;
+    }
+    None
+}
+
+fn xy_cut_rec(
+    items: &[ProjectedTextItem],
+    idxs: Vec<usize>,
+    bbox: Rect,
+    depth: u32,
+    median_h: f32,
+    figures: &[Rect],
+) -> Region {
+    if idxs.len() <= XY_MIN_ITEMS_TO_CUT || depth >= XY_MAX_DEPTH {
+        return Region {
+            bbox,
+            kind: RegionKind::Leaf { item_indices: idxs },
+        };
+    }
+    // Banner cut wins over density-based valleys. Score is f32::INFINITY so
+    // the existing comparison logic naturally selects it.
+    let banner = xy_find_banner_cut(items, &idxs, &bbox, median_h);
+    let h = xy_find_best_cut(items, &idxs, &bbox, CutAxis::Horizontal, median_h, figures);
+    let v = xy_find_best_cut(items, &idxs, &bbox, CutAxis::Vertical, median_h, figures);
+    // Fallback column-start histogram. Only consulted when BOTH density
+    // cuts returned None — those are the cases (wide-heading filled gutter,
+    // figure-straddle layouts) where the column structure is real but the
+    // density projection can't see it. If either density cut found a
+    // valley, trust it instead of firing the histogram fallback.
+    // Run the histogram probe unconditionally: besides being a fallback cut
+    // source, its fill gate is the region-level table detector — when it
+    // rejects with "tabular", density V-cuts must not slice the table's
+    // inter-column gutters either (the dominant column-major-table failure).
+    let mut region_tabular = false;
+    let column_full = xy_find_column_cut(items, &idxs, &bbox, median_h, &mut region_tabular);
+    let column = if v.is_none() && h.is_none() {
+        column_full
+    } else {
+        None
+    };
+    let debug_xy = std::env::var("LITEPARSE_DEBUG_XY").is_ok();
+    let disable_vcut_minlines = std::env::var("LITEPARSE_DISABLE_VCUT_MINLINES").is_ok();
+    if debug_xy && depth == 0 && std::env::var("LITEPARSE_DEBUG_ITEMS").is_ok() {
+        for &i in &idxs {
+            let it = &items[i].item;
+            eprintln!(
+                "[xy item] x={:.1} w={:.1} y={:.1} h={:.1} text={:?}",
+                it.x,
+                it.width,
+                it.y,
+                it.height,
+                &it.text.chars().take(80).collect::<String>()
+            );
+        }
+    }
+    if debug_xy {
+        // Also probe what the column histogram WOULD return if we ran it
+        // unconditionally — this is the diagnostic that tells us whether
+        // reordering V/H/column priority would unlock more column splits.
+        let column_probe = column_full;
+        let pad = "  ".repeat(depth as usize);
+        let fmt = |c: &Option<CutCandidate>| {
+            c.as_ref()
+                .map(|c| format!("{:?}@{:.1}/{:.3}", c.axis, c.position, c.score))
+                .unwrap_or_else(|| "-".to_string())
+        };
+        let fmt_pos = |p: &Option<f32>| {
+            p.as_ref()
+                .map(|p| format!("{p:.1}"))
+                .unwrap_or_else(|| "-".to_string())
+        };
+        let (ex0, ex1) = x_extent(items, &idxs);
+        let lines = xy_distinct_lines(items, &idxs, median_h);
+        eprintln!(
+            "[xy d={depth}]{pad} bbox=({:.0},{:.0} {:.0}x{:.0}) items={} lines={} x_ext=[{ex0:.1},{ex1:.1}] banner={} h={} v={} col={} col_probe={}",
+            bbox.x,
+            bbox.y,
+            bbox.width,
+            bbox.height,
+            idxs.len(),
+            lines,
+            fmt(&banner),
+            fmt(&h),
+            fmt(&v),
+            fmt_pos(&column.as_ref().map(|c| c.position)),
+            fmt_pos(&column_probe.as_ref().map(|c| c.position)),
+        );
+    }
+    // Build a priority-ordered candidate list.
+    //
+    // **Primary** is the cut chosen by the main resolution order
+    // (banner → column → H/V resolved by score margin). **Fallback** is
+    // the column-histogram probe — but ONLY that, not density V or the
+    // other density axis. The column histogram has strong discriminators
+    // (2 strong dominant balanced peaks); a density V valley that lost to
+    // H by the score margin is often a layout coincidence (mid-line word
+    // clustering) we shouldn't trust as a fallback. Falling through to
+    // the histogram-only fallback — rather than collapsing to a leaf —
+    // is what unblocks 2-column pages whose density H-cut peels a
+    // footer/header but trips the min-lines guard.
+    let (h_score, v_score) = (h.as_ref().map(|c| c.score), v.as_ref().map(|c| c.score));
+    let prefer_h_over_v = match (h_score, v_score) {
+        (Some(hs), Some(vs)) => vs <= hs * XY_V_PREFERENCE_MARGIN,
+        _ => true,
+    };
+    let mut candidates: Vec<CutCandidate> = Vec::new();
+    if let Some(bc) = banner {
+        candidates.push(bc);
+    }
+    if let Some(cc) = column {
+        candidates.push(cc);
+    }
+    // Primary density cut, then the other axis as fallback. Without the
+    // alternate-axis fallback, a low-impact H-cut that wins by the score
+    // margin (e.g. peeling a 1-line footer) trips the min-lines guard and
+    // collapses the whole region to a single leaf — masking the real
+    // column structure the V-cut would have revealed.
+    // When the histogram fill gate classified this region as tabular, a
+    // density V valley here is a table gutter, not a column boundary —
+    // suppress it so the table reaches the table detectors row-major.
+    let v = if region_tabular {
+        if debug_xy && v.is_some() {
+            let pad = "  ".repeat(depth as usize);
+            eprintln!("[xy d={depth}]{pad} -> SUPPRESS density V (region tabular)");
+        }
+        None
+    } else {
+        v
+    };
+    if prefer_h_over_v {
+        if let Some(hc) = h {
+            candidates.push(hc);
+        }
+        if let Some(vc) = v {
+            candidates.push(vc);
+        }
+    } else {
+        if let Some(vc) = v {
+            candidates.push(vc);
+        }
+        if let Some(hc) = h {
+            candidates.push(hc);
+        }
+    }
+    // Final fallback: re-use the unconditional column-histogram probe.
+    // Skipped when an existing candidate is already a histogram-derived
+    // column cut (score = 1.0e9 from `xy_find_column_cut`).
+    if !candidates
+        .iter()
+        .any(|c| c.axis == CutAxis::Vertical && (c.score - 1.0e9).abs() < 1.0)
+        && let Some(cc) = column_full
+    {
+        candidates.push(cc);
+    }
+
+    for cut in candidates {
+        if debug_xy {
+            let pad = "  ".repeat(depth as usize);
+            eprintln!(
+                "[xy d={depth}]{pad} -> TRY {:?}@{:.1}/{:.3}",
+                cut.axis, cut.position, cut.score
+            );
+        }
+        let mut left: Vec<usize> = Vec::new();
+        let mut right: Vec<usize> = Vec::new();
+        // Column-histogram V-cuts (score = 1.0e9) split between two column
+        // left-edge clusters. The cut sits at the midpoint between the two
+        // peak x's, which is typically far inside the left column. PDFium
+        // routinely emits a single visual line as multiple items (line-start
+        // + mid-line emphasis fragments + late-line clusters); each item has
+        // its own x, so an item-by-item partition by `it.x` will split one
+        // logical line across both sides whenever a continuation fragment
+        // starts past `cut.position`. Verified on `031a888e…page_1` where
+        // a histogram V-cut at x=360.8 inside column 2 routed the body-start
+        // fragments at x=312 LEFT but their same-baseline continuation
+        // "In Section 2 the" at x=474 RIGHT, orphaning the snippet from its
+        // paragraph and producing a stranded block downstream.
+        //
+        // Fix: for histogram V-cuts, first measure how many y-bands have items
+        // on *both* sides of the cut ("straddling rows"). A real column
+        // boundary has every body row straddling (text in left + right column
+        // on the same baseline) — partition by `it.x` so each column gets its
+        // items. An intra-column histogram split (031a888e case: a single line
+        // wrapped into multiple items at different x's) has almost no
+        // straddling rows — partition by row leftmost-x so a wrapped line
+        // stays whole. The threshold (>~25% of rows straddle) cleanly
+        // separates: 0145bc47 (every body row straddles, ~100%) gets per-item
+        // partition; 031a888e (1 of ~45 rows straddles, ~2%) gets per-row.
+        //
+        // Density V-cuts (white-space valleys) still use centroid: they only
+        // fire where a real text-free vertical band exists, so an item that
+        // crosses a density cut is genuinely wider than the column.
+        let is_histogram_v_cut = cut.axis == CutAxis::Vertical && (cut.score - 1.0e9).abs() < 1.0;
+        if is_histogram_v_cut {
+            // Sort by y then x so items on one baseline cluster together.
+            let mut sorted_idxs: Vec<usize> = idxs.clone();
+            sorted_idxs.sort_by(|&a, &b| {
+                items[a]
+                    .item
+                    .y
+                    .total_cmp(&items[b].item.y)
+                    .then(items[a].item.x.total_cmp(&items[b].item.x))
+            });
+            let band_tol = (median_h * 0.5).max(2.0);
+
+            // First pass: count rows with items entirely-left, entirely-right,
+            // or straddling the cut. Decides the partition strategy.
+            let (mut rows_total, mut rows_straddle) = (0usize, 0usize);
+            let mut k = 0;
+            while k < sorted_idxs.len() {
+                let band_y = items[sorted_idxs[k]].item.y;
+                let mut j = k;
+                let mut has_left = false;
+                let mut has_right = false;
+                while j < sorted_idxs.len()
+                    && (items[sorted_idxs[j]].item.y - band_y).abs() <= band_tol
+                {
+                    let ix = items[sorted_idxs[j]].item.x;
+                    if ix.is_finite() {
+                        if ix < cut.position {
+                            has_left = true;
+                        } else {
+                            has_right = true;
+                        }
+                    }
+                    j += 1;
+                }
+                if has_left || has_right {
+                    rows_total += 1;
+                    if has_left && has_right {
+                        rows_straddle += 1;
+                    }
+                }
+                k = j;
+            }
+            // 25% threshold: when a quarter or more of rows have content on
+            // both sides of the cut, it's a real column boundary (every body
+            // row has text in both columns). Below that, the cut sits inside
+            // a single column and the rare straddler is an intra-column
+            // wrapped line that must not be torn apart.
+            const STRADDLE_PARTITION_FRACTION: f32 = 0.25;
+            let partition_by_item = rows_total > 0
+                && (rows_straddle as f32) / (rows_total as f32) >= STRADDLE_PARTITION_FRACTION;
+            if debug_xy {
+                let pad = "  ".repeat(depth as usize);
+                eprintln!(
+                    "[xy d={depth}]{pad}    hist-v straddle={}/{} → partition_by_{}",
+                    rows_straddle,
+                    rows_total,
+                    if partition_by_item { "item" } else { "row" }
+                );
+            }
+
+            if partition_by_item {
+                for &i in &idxs {
+                    if items[i].item.x < cut.position {
+                        left.push(i);
+                    } else {
+                        right.push(i);
+                    }
+                }
+            } else {
+                let mut k = 0;
+                while k < sorted_idxs.len() {
+                    let band_y = items[sorted_idxs[k]].item.y;
+                    let mut j = k;
+                    let mut min_x = f32::INFINITY;
+                    while j < sorted_idxs.len()
+                        && (items[sorted_idxs[j]].item.y - band_y).abs() <= band_tol
+                    {
+                        let ix = items[sorted_idxs[j]].item.x;
+                        if ix.is_finite() && ix < min_x {
+                            min_x = ix;
+                        }
+                        j += 1;
+                    }
+                    let side_left = min_x < cut.position;
+                    for &i in &sorted_idxs[k..j] {
+                        if side_left {
+                            left.push(i);
+                        } else {
+                            right.push(i);
+                        }
+                    }
+                    k = j;
+                }
+            }
+        } else {
+            for &i in &idxs {
+                let it = &items[i].item;
+                let split_at = match cut.axis {
+                    CutAxis::Horizontal => it.y + it.height.max(0.0) * 0.5,
+                    CutAxis::Vertical => it.x + it.width.max(0.0) * 0.5,
+                };
+                if split_at < cut.position {
+                    left.push(i);
+                } else {
+                    right.push(i);
+                }
+            }
+        }
+        if debug_xy {
+            let pad = "  ".repeat(depth as usize);
+            eprintln!(
+                "[xy d={depth}]{pad}    partition: left={} right={}",
+                left.len(),
+                right.len()
+            );
+        }
+        if left.is_empty() || right.is_empty() {
+            if debug_xy {
+                let pad = "  ".repeat(depth as usize);
+                eprintln!("[xy d={depth}]{pad}    -> degenerate, try next");
+            }
+            continue;
+        }
+        let (left_bbox, right_bbox) = xy_split_bbox(&bbox, &cut);
+
+        // Banner cuts (score = ∞) at the page root are explicitly meant to
+        // isolate single-line wide headers like titles, so skip the
+        // min-lines guard for them. At deeper recursion levels we keep the
+        // guard — an aggressive single-line banner cut mid-recursion
+        // fragments paragraphs around emphasized lines (e.g. a centered
+        // "Figure N caption" sandwiched between body paragraphs would
+        // otherwise carve out its own sliver region and break paragraph
+        // continuation).
+        let allow_single_line =
+            cut.axis == CutAxis::Horizontal && cut.score.is_infinite() && depth == 0;
+        if cut.axis == CutAxis::Horizontal && !allow_single_line {
+            let lc = xy_distinct_lines(items, &left, median_h);
+            let rc = xy_distinct_lines(items, &right, median_h);
+            // Rescue: a single wide spanning line (e.g. a centered
+            // authors / affiliation line above a two-column body) is
+            // worth isolating even mid-recursion when peeling it reveals
+            // the column gutter underneath. Otherwise the spanning line
+            // straddles the gutter, the V-cut can never fire, and the
+            // whole body interleaves column-by-column. The density H-cut
+            // that peels it has a finite score (the line is often just
+            // under the banner width threshold), so this is NOT gated on
+            // a banner cut. Discriminator vs. carving a single-column
+            // caption out of running prose: the thin side must be one
+            // line whose x-extent crosses the gutter revealed on the
+            // other (multi-line) side.
+            let spanning_rescue = {
+                let thin_wide = if lc < XY_MIN_LINES_PER_H_SIDE && rc >= XY_MIN_LINES_PER_H_SIDE {
+                    Some(((&left, lc), (&right, &right_bbox)))
+                } else if rc < XY_MIN_LINES_PER_H_SIDE && lc >= XY_MIN_LINES_PER_H_SIDE {
+                    Some(((&right, rc), (&left, &left_bbox)))
+                } else {
+                    None
+                };
+                thin_wide.is_some_and(|((thin, thin_lines), (wide, wide_bbox))| {
+                    thin_lines <= 1
+                        && column_cut_x(items, wide, wide_bbox, median_h, figures).is_some_and(
+                            |gx| {
+                                let (tx0, tx1) = x_extent(items, thin);
+                                tx0 < gx - 1.0 && tx1 > gx + 1.0
+                            },
+                        )
+                })
+            };
+            if (lc < XY_MIN_LINES_PER_H_SIDE || rc < XY_MIN_LINES_PER_H_SIDE) && !spanning_rescue {
+                if debug_xy {
+                    let pad = "  ".repeat(depth as usize);
+                    eprintln!(
+                        "[xy d={depth}]{pad}    -> min-lines fail (lc={lc} rc={rc}), try next"
+                    );
+                }
+                continue;
+            }
+        }
+        // Vertical (column) min-lines guard. A real column gutter is sustained
+        // across multiple stacked lines on both sides. A vertical cut that
+        // isolates a single-line "column" is a false gutter: in single-column
+        // justified prose, a short final line plus a wide inter-word gap in the
+        // full-width line above it align an empty vertical band that is not a
+        // column boundary. Without this, that band splits the physical line
+        // into two sibling regions and the markdown emitter renders them out of
+        // order (e.g. "…and its share repurchases are 100%" → the tail is
+        // sliced off into its own region). The initial true 2-column split has
+        // many lines per side, so this never blocks real columns.
+        if cut.axis == CutAxis::Vertical && !disable_vcut_minlines {
+            let lc = xy_distinct_lines(items, &left, median_h);
+            let rc = xy_distinct_lines(items, &right, median_h);
+            if lc < XY_MIN_LINES_PER_H_SIDE || rc < XY_MIN_LINES_PER_H_SIDE {
+                if debug_xy {
+                    let pad = "  ".repeat(depth as usize);
+                    eprintln!(
+                        "[xy d={depth}]{pad}    -> v-cut min-lines fail (lc={lc} rc={rc}), try next"
+                    );
+                }
+                continue;
+            }
+        }
+
+        if debug_xy {
+            let pad = "  ".repeat(depth as usize);
+            eprintln!(
+                "[xy d={depth}]{pad} -> COMMIT {:?}@{:.1}",
+                cut.axis, cut.position
+            );
+        }
+        let left_region = xy_cut_rec(items, left, left_bbox, depth + 1, median_h, figures);
+        let right_region = xy_cut_rec(items, right, right_bbox, depth + 1, median_h, figures);
+        return Region {
+            bbox,
+            kind: RegionKind::Split {
+                axis: cut.axis,
+                children: vec![left_region, right_region],
+            },
+        };
+    }
+
+    if debug_xy {
+        let pad = "  ".repeat(depth as usize);
+        eprintln!("[xy d={depth}]{pad} -> LEAF (no valid cut)");
+    }
+    Region {
+        bbox,
+        kind: RegionKind::Leaf { item_indices: idxs },
+    }
+}
+
+/// Build the page's XY-cut region tree.
+///
+/// `figures` is an optional set of figure-region bounding rectangles (from
+/// `figure_cluster::detect_figure_rects`); pass `&[]` to disable obstacle
+/// seeding. Figures cause the recursion to favor cuts around them.
+pub(crate) fn xy_cut(
+    items: &[ProjectedTextItem],
+    page_width: f32,
+    page_height: f32,
+    figures: &[Rect],
+) -> Region {
+    let all: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| !it.item.text.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    if all.is_empty() {
+        return Region {
+            bbox: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: page_width.max(1.0),
+                height: page_height.max(1.0),
+            },
+            kind: RegionKind::Leaf {
+                item_indices: Vec::new(),
+            },
+        };
+    }
+    let bbox = xy_root_bbox(items, page_width, page_height);
+    let median_h = xy_median_line_height(items, &all);
+    xy_cut_rec(items, all, bbox, 0, median_h, figures)
+}
+
+/// Pre-order walk of leaves. Each leaf yields its `region_path` (index trail
+/// from the root) and item indices. Leaves with no items are skipped.
+fn xy_walk_leaves(region: &Region, path: &mut Vec<u16>, out: &mut Vec<(Vec<u16>, Vec<usize>)>) {
+    match &region.kind {
+        RegionKind::Leaf { item_indices } => {
+            if !item_indices.is_empty() {
+                out.push((path.clone(), item_indices.clone()));
+            }
+        }
+        RegionKind::Split { children, .. } => {
+            for (i, child) in children.iter().enumerate() {
+                path.push(i as u16);
+                xy_walk_leaves(child, path, out);
+                path.pop();
+            }
+        }
+    }
+}
+
+/// Group `items` into per-leaf lines using the XY-cut region tree, then derive
+/// per-line aggregates. Leaves are walked pre-order so reading order follows
+/// the layout — top→bottom bands, left→right columns, recursively. Returns
+/// the populated lines and the region tree so callers can persist it on
+/// `ParsedPage`.
+pub(crate) fn build_projected_lines(
+    items: &[ProjectedTextItem],
+    page_width: f32,
+    page_height: f32,
+    figures: &[Rect],
+) -> (Vec<ProjectedLine>, Region) {
+    if items.is_empty() {
+        return (Vec::new(), Region::default());
+    }
+
+    let region = xy_cut(items, page_width, page_height, figures);
+    let mut leaves: Vec<(Vec<u16>, Vec<usize>)> = Vec::new();
+    xy_walk_leaves(&region, &mut Vec::new(), &mut leaves);
+
+    // Figures used for the per-line `in_figure` heading-exclusion flag. Drop
+    // page-dominating figures: on posters / slides / infographics the whole
+    // page is one large graphic and its big text *is* the heading content, so
+    // excluding it would demote real headings. A chart on an academic page
+    // covers only a fraction of the page — that's the pollution we want out of
+    // the heading histogram.
+    let page_area = (page_width.max(1.0)) * (page_height.max(1.0));
+    let heading_excl_figures: Vec<Rect> = figures
+        .iter()
+        .filter(|f| f.width * f.height < page_area * 0.55)
+        .cloned()
+        .collect();
+    // On a page with native text, OCR only enriches embedded figures
+    // (charts, diagrams, formula images, logos). Lines built from that OCR
+    // text are figure content whatever their box height says, so they are
+    // excluded from heading candidacy like any other in-figure line. On a
+    // scanned page (no native text) OCR *is* the text and headings must
+    // still come from it.
+    let page_has_native_text = items
+        .iter()
+        .any(|p| p.item.font_name.as_deref() != Some("OCR"));
+
+    let mut out: Vec<ProjectedLine> = Vec::new();
+    for (path, indices) in leaves {
+        // Sort within the leaf by y, tie-break by x. `build_one_line` re-sorts
+        // by x for left→right concatenation; the y-banding loop here only
+        // needs y order.
+        let mut sorted = indices;
+        sorted.sort_by(|&a, &b| {
+            items[a]
+                .item
+                .y
+                .total_cmp(&items[b].item.y)
+                .then(items[a].item.x.total_cmp(&items[b].item.x))
+        });
+
+        let mut current: Vec<usize> = Vec::new();
+        let mut current_y: f32 = 0.0;
+        let mut current_h: f32 = 0.0;
+        // PDFium occasionally reports anomalously large item heights (e.g.
+        // 56pt for a single-word run whose real glyph height is ~13pt) when
+        // the font's bounding box / line-height is baked into the text-matrix
+        // scale. Without a cap, the y-band tolerance `max(h) * 0.5` swallows
+        // multiple distinct baselines into one projected line (visible on
+        // docs 121, 122 — fill-in-the-blank lab worksheets). Clamp at 24pt
+        // for the banding decision; the actual stored line bbox is unchanged.
+        const Y_BAND_HEIGHT_CAP: f32 = 24.0;
+        for idx in sorted {
+            let y = items[idx].item.y;
+            let raw_h = items[idx].item.height;
+            let h = raw_h.clamp(1.0, Y_BAND_HEIGHT_CAP);
+            if current.is_empty() {
+                current.push(idx);
+                current_y = y;
+                current_h = h;
+                continue;
+            }
+            // Use the SMALLER of the two heights for the y-band tolerance —
+            // matching baselines (same row) differ by ≪ either glyph height,
+            // while the next-row-down baseline differs by ≈ the smaller
+            // glyph's full height. Using `.max()` here is fooled by
+            // matrix-inflated em-boxes: a 16pt heading row "swallows" a
+            // 50pt-em-box body item on the row below because the tolerance
+            // becomes 25pt. Reproducer: doc 122 ("III. Electrophorese" at
+            // y=286.2 vs "Reagents:" at y=295.9, diff=9.7pt).
+            // When the incoming item's raw bbox is wildly taller than the
+            // current line's anchor (>2× and >Y_BAND_HEIGHT_CAP), this is
+            // an em-box-inflated body item trying to crash into a heading
+            // row. Halve the tolerance further so a small y-offset (4–7pt)
+            // doesn't fuse them. Reproducer: doc 122 "Load the Gel"
+            // (h=14.9, y=435.6) vs next-row "Use" (h=55.6, y=442.0,
+            // diff=6.4pt vs 14.9*0.5=7.45 tolerance — too permissive).
+            let height_mismatch = raw_h > Y_BAND_HEIGHT_CAP && raw_h > current_h * 2.0;
+            let tol_factor = if height_mismatch { 0.3 } else { 0.5 };
+            let same = (y - current_y).abs() < current_h.min(h) * tol_factor;
+            if same {
+                current.push(idx);
+                current_y = current_y.min(y);
+                current_h = current_h.max(h);
+            } else {
+                out.push(build_one_line(
+                    items,
+                    &current,
+                    path.clone(),
+                    &heading_excl_figures,
+                    page_has_native_text,
+                ));
+                current = vec![idx];
+                current_y = y;
+                current_h = h;
+            }
+        }
+        if !current.is_empty() {
+            out.push(build_one_line(
+                items,
+                &current,
+                path.clone(),
+                &heading_excl_figures,
+                page_has_native_text,
+            ));
+        }
+    }
+
+    // Normalize `indent_x` to be leaf-relative: subtract each leaf's minimum
+    // line bbox.x from every line in that leaf. This way list-nesting and
+    // paragraph-indent comparisons in `markdown_layout.rs` use offsets from
+    // the column's left edge rather than absolute page x. Multi-column pages
+    // would otherwise see every column-2 line as "indented" relative to
+    // column-1 lines.
+    {
+        use std::collections::HashMap;
+        let mut leaf_min: HashMap<Vec<u16>, f32> = HashMap::new();
+        for line in &out {
+            let e = leaf_min
+                .entry(line.region_path.clone())
+                .or_insert(f32::INFINITY);
+            if line.indent_x < *e {
+                *e = line.indent_x;
+            }
+        }
+        for line in &mut out {
+            if let Some(min) = leaf_min.get(&line.region_path)
+                && min.is_finite()
+            {
+                line.indent_x -= *min;
+                if line.indent_x < 0.0 {
+                    line.indent_x = 0.0;
+                }
+            }
+        }
+    }
+
+    (out, region)
+}
+
+fn build_one_line(
+    items: &[ProjectedTextItem],
+    idxs: &[usize],
+    region_path: Vec<u16>,
+    figures: &[Rect],
+    page_has_native_text: bool,
+) -> ProjectedLine {
+    // Sort by x so concatenation reads left→right even if reading order had
+    // rotated insertions. `spans` stays in this x-ascending order — the table
+    // cell splitter and the inline emphasis renderer both read geometry off it
+    // — while `text` below is joined in *reading* order, which for a
+    // right-to-left line runs the other way across the page.
+    let mut sorted: Vec<usize> = idxs.to_vec();
+    sorted.sort_by(|a, b| items[*a].item.x.total_cmp(&items[*b].item.x));
+
+    // Item texts in x order; joined once the line's base direction is known.
+    let mut piece_texts: Vec<&str> = Vec::with_capacity(sorted.len());
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    // Original-coordinate bbox (pre-rotation-displacement). `figures` are in
+    // original page space, so figure-overlap must be tested here, not against
+    // the projected `bbox` below (which can be displaced onto a virtual canvas
+    // by `handle_rotation_reading_order`).
+    let mut omin_x = f32::INFINITY;
+    let mut omin_y = f32::INFINITY;
+    let mut omax_x = f32::NEG_INFINITY;
+    let mut omax_y = f32::NEG_INFINITY;
+
+    let mut size_weights: HashMap<u32, (f32, usize)> = HashMap::new();
+    let mut height_weights: HashMap<u32, (f32, usize)> = HashMap::new();
+    // Matrix-derived true on-page size (`Tf_size × text_matrix_scale`, computed
+    // in extract.rs). For matrix-baked-size fonts this is the precise size the
+    // raw `font_size` (≈1.0) hides; jitter-free, unlike bbox height.
+    let mut font_height_weights: HashMap<u32, (f32, usize)> = HashMap::new();
+    let mut name_weights: HashMap<String, usize> = HashMap::new();
+    let mut bold_chars: usize = 0;
+    let mut italic_chars: usize = 0;
+    let mut mono_chars: usize = 0;
+    let mut total_chars: usize = 0;
+    // Chars contributed by OCR-sourced items. Their `font_size` is the OCR
+    // box height, i.e. a bbox estimate with the same jitter as the
+    // baked-size fallback below, so an OCR-dominated line is flagged
+    // `font_size_is_estimated` and gets the wider heading margin. Without
+    // this, chart labels OCR'd at 9.1–9.6pt next to a 9pt body open heading
+    // levels the body then matches under the 0.6pt tolerance.
+    let mut ocr_chars: usize = 0;
+    let mut anchor_weights: HashMap<u8, usize> = HashMap::new();
+    let mut mcid: Option<i32> = None;
+    let mut spans: Vec<TextItem> = Vec::with_capacity(sorted.len());
+
+    for &i in sorted.iter() {
+        let proj = &items[i];
+        let it = &proj.item;
+        // `handle_rotation_reading_order` zeroes `item.rotation` after it
+        // reorders cardinal-rotated text into reading order, so the span would
+        // otherwise look horizontal to `is_rotated_line`. Restore the original
+        // rotation onto the span clone (only consumed by markdown heading/TOC
+        // rotation guards) so a sideways margin stamp doesn't pollute the
+        // heading-size map.
+        let mut span = it.clone();
+        span.rotation = proj.orig_rotation;
+        spans.push(span);
+
+        // Collect item text. Use existing num_spaces from projection only as
+        // a hint — the markdown emitter re-collapses whitespace, so we just
+        // ensure there's *some* separation between adjacent items.
+        piece_texts.push(it.text.as_str());
+
+        min_x = min_x.min(it.x);
+        min_y = min_y.min(it.y);
+        max_x = max_x.max(it.x + it.width);
+        max_y = max_y.max(it.y + it.height);
+
+        omin_x = omin_x.min(proj.orig_x);
+        omin_y = omin_y.min(proj.orig_y);
+        omax_x = omax_x.max(proj.orig_x + proj.orig_width);
+        omax_y = omax_y.max(proj.orig_y + proj.orig_height);
+
+        let n = it.text.chars().count().max(1);
+        total_chars += n;
+        if it.font_name.as_deref() == Some("OCR") {
+            ocr_chars += n;
+        }
+
+        if let Some(size) = it.font_size
+            && size > 0.0
+        {
+            let key = (size * 100.0).round() as u32;
+            let e = size_weights.entry(key).or_insert((size, 0));
+            e.1 += n;
+        }
+        let h_key = (it.height.max(0.0) * 100.0).round() as u32;
+        let e = height_weights.entry(h_key).or_insert((it.height, 0));
+        e.1 += n;
+        if let Some(fh) = it.font_height
+            && fh > 1.5
+        {
+            let fh_key = (fh * 100.0).round() as u32;
+            let e = font_height_weights.entry(fh_key).or_insert((fh, 0));
+            e.1 += n;
+        }
+
+        if let Some(name) = &it.font_name {
+            *name_weights.entry(name.clone()).or_insert(0) += n;
+        }
+
+        if is_bold_item(it) {
+            bold_chars += n;
+        }
+        if is_italic_item(it) {
+            italic_chars += n;
+        }
+        if is_mono_item(it) {
+            mono_chars += n;
+        }
+
+        let akey = match proj.anchor {
+            Anchor::Left => 0u8,
+            Anchor::Right => 1,
+            Anchor::Center => 2,
+            Anchor::Floating => 3,
+        };
+        *anchor_weights.entry(akey).or_insert(0) += n;
+
+        if mcid.is_none() {
+            mcid = it.mcid;
+        }
+    }
+
+    // Join the line in reading order. PDFium already hands back each item's
+    // characters in logical order, so a right-to-left line only needs its
+    // *items* walked right-to-left across the page — otherwise an invoice line
+    // like "المجموع الفرعي: 75.00 SAR" comes out as "SAR 75.00 المجموع الفرعي:",
+    // detaching every label from its value. Direction is decided from the
+    // assembled line, so a neutral-only line (pure digits) stays LTR and every
+    // left-to-right document takes exactly the path it took before.
+    let rtl = crate::bidi::is_rtl_pieces(piece_texts.iter().copied());
+    if rtl {
+        piece_texts.reverse();
+    }
+    let mut text = String::new();
+    for piece in &piece_texts {
+        if !text.is_empty() && !text.ends_with(' ') {
+            text.push(' ');
+        }
+        text.push_str(piece);
+    }
+
+    // NOTE on tie-breaks: `max_by_key` over a HashMap returns the *last* max it
+    // iterates, and HashMap iteration order is randomized per process. Ties on
+    // char-weight would therefore pick a different winner every run, making the
+    // line's font size / name / anchor non-deterministic (and with them, heading
+    // and emphasis classification downstream). We break every tie on the bucket
+    // key so the result is stable across runs.
+    let dominant_size_from_font = size_weights
+        .iter()
+        .max_by_key(|(k, (_, n))| (*n, **k))
+        .map(|(_, (s, _))| *s)
+        .unwrap_or(0.0);
+    // Fallback: when PDFium reports font_size ≤ 1.5 (size baked into the text
+    // matrix), use char-weighted bbox height so the size-dependent grouping
+    // (tables, paragraphs) keeps its well-tuned behavior.
+    let ocr_dominated = ocr_chars * 2 > total_chars;
+    let (dominant_font_size, font_size_is_estimated) = if dominant_size_from_font > 1.5 {
+        (dominant_size_from_font, ocr_dominated)
+    } else {
+        let h = height_weights
+            .iter()
+            .max_by_key(|(k, (_, n))| (*n, **k))
+            .map(|(_, (h, _))| *h)
+            .unwrap_or(0.0);
+        (h, true)
+    };
+
+    // Precise size for *heading detection only*: when the raw size is baked,
+    // the matrix-derived `font_height` (Tf_size × text_matrix_scale) is the
+    // jitter-free on-page size, far better than the bbox-height estimate above
+    // for separating headings from body. Routed only to body-size + heading-map
+    // (see `heading_font_size` doc on ProjectedLine); table/paragraph grouping
+    // deliberately keeps the bbox-height value to avoid regressing table
+    // structure.
+    let heading_font_size = if dominant_size_from_font > 1.5 {
+        None
+    } else {
+        font_height_weights
+            .iter()
+            .max_by_key(|(k, (_, n))| (*n, **k))
+            .map(|(_, (h, _))| *h)
+    };
+
+    let dominant_font_name = name_weights
+        .iter()
+        .max_by_key(|(name, n)| (**n, *name))
+        .map(|(name, _)| name.clone());
+
+    let majority = |count: usize| total_chars > 0 && count * 2 > total_chars;
+
+    let dominant_anchor_key = anchor_weights
+        .iter()
+        .max_by_key(|(k, n)| (**n, **k))
+        .map(|(k, _)| *k)
+        .unwrap_or(0);
+    let anchor = match dominant_anchor_key {
+        1 => Anchor::Right,
+        2 => Anchor::Center,
+        3 => Anchor::Floating,
+        _ => Anchor::Left,
+    };
+
+    let bbox = Rect {
+        x: if min_x.is_finite() { min_x } else { 0.0 },
+        y: if min_y.is_finite() { min_y } else { 0.0 },
+        width: if max_x.is_finite() && min_x.is_finite() {
+            (max_x - min_x).max(0.0)
+        } else {
+            0.0
+        },
+        height: if max_y.is_finite() && min_y.is_finite() {
+            (max_y - min_y).max(0.0)
+        } else {
+            0.0
+        },
+    };
+
+    // Figure membership: ≥50% of the line's original-coordinate area inside a
+    // detected figure that is also clearly taller than the line. The height
+    // guard is what separates real chart pollution (axis labels, legends — set
+    // inside tall plot regions) from a section heading sitting on a thin
+    // colored background bar, which figure detection can mis-cluster as a
+    // figure ~1 line tall. Only the former should lose heading candidacy.
+    let line_h = (omax_y - omin_y).max(0.0);
+    let in_figure = if omax_x > omin_x && line_h > 0.0 {
+        let line_area = (omax_x - omin_x) * line_h;
+        figures.iter().any(|f| {
+            if f.height < line_h * 3.0 {
+                return false;
+            }
+            let ix = (omax_x.min(f.x + f.width) - omin_x.max(f.x)).max(0.0);
+            let iy = (omax_y.min(f.y + f.height) - omin_y.max(f.y)).max(0.0);
+            line_area > 0.0 && (ix * iy) / line_area >= 0.5
+        })
+    } else {
+        false
+    } || (ocr_dominated && page_has_native_text);
+
+    ProjectedLine {
+        text,
+        rtl,
+        bbox: bbox.clone(),
+        anchor,
+        // Real column detection is deferred (carry-forward in MARKDOWN_PROGRESS).
+        // `indent_x` mirrors bbox.x for now; the markdown emitter relies on
+        // this for paragraph/list-indent comparisons within a single column.
+        indent_x: bbox.x,
+        dominant_font_size,
+        font_size_is_estimated,
+        heading_font_size,
+        dominant_font_name,
+        all_bold: majority(bold_chars),
+        all_italic: majority(italic_chars),
+        all_mono: majority(mono_chars),
+        all_strike: false,
+        spans,
+        region_path,
+        mcid,
+        in_figure,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compress_wide_spaces_preserves_utf8_text() {
+        assert_eq!(
+            compress_wide_spaces("売上高    1,234 Café  Größe", 4, 2),
+            "売上高  1,234 Café  Größe"
+        );
+    }
+
+    #[test]
+    fn sparse_blocks_preserve_utf8_text_when_compressing_columns() {
+        let labels = ["売上高", "営業利益", "Café", "Größe"];
+        let mut lines: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label}{}1,234", " ".repeat(120)))
+            .collect();
+        let end = lines.len();
+
+        fix_sparse_blocks(&mut lines, 0, end);
+
+        let expected: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label}{}1,234", " ".repeat(FLOATING_SPACES)))
+            .collect();
+        assert_eq!(lines, expected);
+    }
 
     fn projected_item(text: &str, y: f32, width: f32, height: f32) -> ProjectedTextItem {
         ProjectedTextItem {
@@ -2891,9 +5429,18 @@ mod tests {
     fn project_to_grid_handles_text_sparse_zero_width_items() {
         let page = Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
+            content_bounds: None,
+            graphics: Vec::new(),
+            vector_graphics: None,
             text_items: Vec::new(),
+            struct_nodes: Vec::new(),
+            image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
         };
         let projection_boxes = vec![
             projected_item("", 10.0, 0.0, 10.0),
@@ -2903,6 +5450,384 @@ mod tests {
         let (_, text) = project_to_grid(&page, projection_boxes);
 
         assert!(text.is_empty());
+    }
+
+    fn item_at(text: &str, x: f32, y: f32, w: f32, h: f32) -> ProjectedTextItem {
+        ProjectedTextItem {
+            item: TextItem {
+                text: text.to_string(),
+                x,
+                y,
+                width: w,
+                height: h,
+                ..Default::default()
+            },
+            snap: Snap::Left,
+            anchor: Anchor::Left,
+            is_dup: false,
+            rendered: false,
+            num_spaces: 0,
+            force_unsnapped: false,
+            is_margin_line_number: false,
+            rotated: false,
+            d: 0.0,
+            orig_x: x,
+            orig_y: y,
+            orig_width: w,
+            orig_height: h,
+            orig_rotation: 0.0,
+        }
+    }
+
+    #[test]
+    fn gutter_digit_abutting_neighbour_is_not_margin_line_number() {
+        // Issue #465: a table cell "7.7" emitted as runs "7" + ".7" with zero
+        // gap, sitting in the page-centre band. The "7" must stay on the row
+        // and merge with ".7" instead of being split off as a line number.
+        let mut items = vec![
+            item_at("58.5", 252.7, 149.76, 10.9, 8.42),
+            item_at("7", 313.37, 149.76, 3.108, 8.42),
+            item_at(".7", 316.478, 149.76, 4.66, 8.42),
+            item_at("2.3", 370.9, 149.76, 10.6, 8.42),
+        ];
+        let lines = form_lines(&mut items, 10.0, 8.42, 612.0);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].iter().any(|i| i.item.text == "7.7"));
+        assert!(lines[0].iter().all(|i| !i.is_margin_line_number));
+    }
+
+    #[test]
+    fn isolated_gutter_digit_is_still_margin_line_number() {
+        // Two-column paper: "12" alone in the gutter, well clear of both
+        // columns' text, keeps its line-number flag.
+        let mut items = vec![
+            item_at("left column text", 60.0, 100.0, 230.0, 10.0),
+            item_at("12", 310.0, 100.0, 8.0, 10.0),
+            item_at("right column text", 330.0, 100.0, 230.0, 10.0),
+        ];
+        let lines = form_lines(&mut items, 10.0, 10.0, 612.0);
+        let flagged: Vec<_> = lines
+            .iter()
+            .flatten()
+            .filter(|i| i.is_margin_line_number)
+            .map(|i| i.item.text.as_str())
+            .collect();
+        assert_eq!(flagged, vec!["12"]);
+    }
+
+    #[test]
+    fn xy_cut_finds_column_gutter_on_two_column_layout() {
+        // Two columns, 50pt-wide gutter centered at x=300. Each column has
+        // five rows of body text. Expect: a single vertical split at the
+        // gutter, both children leaves.
+        let mut items = Vec::new();
+        for row in 0..5 {
+            let y = 100.0 + row as f32 * 14.0;
+            items.push(item_at("left side text", 50.0, y, 200.0, 10.0));
+            items.push(item_at("right side text", 350.0, y, 200.0, 10.0));
+        }
+        let region = xy_cut(&items, 612.0, 792.0, &[]);
+        match region.kind {
+            RegionKind::Split { axis, children } => {
+                assert_eq!(axis, CutAxis::Vertical);
+                assert_eq!(children.len(), 2);
+                let l = match &children[0].kind {
+                    RegionKind::Leaf { item_indices } => item_indices.len(),
+                    _ => 0,
+                };
+                let r = match &children[1].kind {
+                    RegionKind::Leaf { item_indices } => item_indices.len(),
+                    _ => 0,
+                };
+                assert_eq!(l, 5, "left col should hold 5 items");
+                assert_eq!(r, 5, "right col should hold 5 items");
+            }
+            _ => panic!("expected a vertical split, got {:?}", region.kind),
+        }
+    }
+
+    #[test]
+    fn xy_cut_returns_leaf_on_single_column_prose() {
+        // Tight single-column text — no valley wide enough to cut.
+        let items: Vec<_> = (0..8)
+            .map(|row| {
+                let y = 100.0 + row as f32 * 12.0;
+                item_at("the quick brown fox", 60.0, y, 400.0, 10.0)
+            })
+            .collect();
+        let region = xy_cut(&items, 612.0, 792.0, &[]);
+        assert!(matches!(region.kind, RegionKind::Leaf { .. }));
+    }
+
+    #[test]
+    fn xy_cut_walk_assigns_reading_order_paths() {
+        // 2-column page: pre-order walk visits left column before right.
+        let mut items = Vec::new();
+        for row in 0..5 {
+            let y = 100.0 + row as f32 * 14.0;
+            items.push(item_at("L", 50.0, y, 200.0, 10.0));
+            items.push(item_at("R", 350.0, y, 200.0, 10.0));
+        }
+        let (lines, _region) = build_projected_lines(&items, 612.0, 792.0, &[]);
+        // Left col's 5 lines come first (path [0, ...]), then right col's 5
+        // (path [1, ...]).
+        assert_eq!(lines.len(), 10);
+        for line in &lines[..5] {
+            assert_eq!(line.region_path.first().copied(), Some(0));
+        }
+        for line in &lines[5..] {
+            assert_eq!(line.region_path.first().copied(), Some(1));
+        }
+    }
+
+    #[test]
+    fn banner_cut_isolates_full_width_title_above_two_columns() {
+        // Layout: a centered wide title at the top, clear gap, then 2-column
+        // body text. Density-based V-cut at the root would place the title
+        // (centroid at page center) inside one of the columns. The banner
+        // detector should H-cut just below the title so it ends up as the
+        // pre-order first leaf, separate from both columns.
+        let mut items = Vec::new();
+        items.push(item_at(
+            "Wide Centered Title Spanning Full Page",
+            100.0,
+            50.0,
+            412.0,
+            14.0,
+        ));
+        // Body starts well below the title (clear vertical gap).
+        for row in 0..5 {
+            let y = 200.0 + row as f32 * 14.0;
+            items.push(item_at("left side text", 50.0, y, 200.0, 10.0));
+            items.push(item_at("right side text", 350.0, y, 200.0, 10.0));
+        }
+        let (lines, _region) = build_projected_lines(&items, 612.0, 792.0, &[]);
+        // First line (in pre-order) must be the title.
+        let first = lines.first().expect("at least one line");
+        assert!(
+            first.text.contains("Title"),
+            "expected title first, got {:?}",
+            first.text
+        );
+        // Title leaf should be different from any column leaf.
+        let body_paths: Vec<&Vec<u16>> = lines[1..].iter().map(|l| &l.region_path).collect();
+        assert!(
+            body_paths.iter().all(|p| **p != first.region_path),
+            "title leaf should not share region_path with body lines"
+        );
+    }
+
+    #[test]
+    fn banner_cut_does_not_fire_on_plain_two_column_layout() {
+        // Same layout as `xy_cut_finds_column_gutter_on_two_column_layout` —
+        // no wide centered element to trigger a banner cut. Regression guard:
+        // the V-cut must still be the first cut at the root.
+        let mut items = Vec::new();
+        for row in 0..5 {
+            let y = 100.0 + row as f32 * 14.0;
+            items.push(item_at("left side text", 50.0, y, 200.0, 10.0));
+            items.push(item_at("right side text", 350.0, y, 200.0, 10.0));
+        }
+        let region = xy_cut(&items, 612.0, 792.0, &[]);
+        match region.kind {
+            RegionKind::Split { axis, .. } => {
+                assert_eq!(axis, CutAxis::Vertical, "expected V-cut, not H");
+            }
+            _ => panic!("expected a split at the root"),
+        }
+    }
+
+    #[test]
+    fn figure_obstacle_forces_h_cut_around_straddling_figure() {
+        // Two text bands separated by a wide figure that spans both halves of
+        // the page. The text alone has no V-gutter and only a modest y-gap;
+        // without obstacle seeding the root would either V-cut (bad — the
+        // figure straddles both sides) or fail to cut at all. With the figure
+        // stamped into density, the H-valleys above/below the figure dominate
+        // and the recursion H-cuts into a top band → figure band → bottom band.
+        let mut items = Vec::new();
+        // Top band: several wide lines of text.
+        for row in 0..4 {
+            let y = 100.0 + row as f32 * 14.0;
+            items.push(item_at(
+                "top band line spans full width",
+                50.0,
+                y,
+                500.0,
+                12.0,
+            ));
+        }
+        // Bottom band: several wide lines, well below the figure.
+        for row in 0..4 {
+            let y = 400.0 + row as f32 * 14.0;
+            items.push(item_at(
+                "bottom band line after the figure",
+                50.0,
+                y,
+                500.0,
+                12.0,
+            ));
+        }
+        // Figure: 500×200pt block centered in the page between the bands.
+        let figures = vec![Rect {
+            x: 60.0,
+            y: 160.0,
+            width: 490.0,
+            height: 200.0,
+        }];
+
+        let region_no_fig = xy_cut(&items, 612.0, 792.0, &[]);
+        let region_with_fig = xy_cut(&items, 612.0, 792.0, &figures);
+
+        // With figures, the root cut must be horizontal (top vs. bottom band).
+        // Drilling through nested splits is fine — we just check the first one.
+        match region_with_fig.kind {
+            RegionKind::Split { axis, .. } => {
+                assert_eq!(
+                    axis,
+                    CutAxis::Horizontal,
+                    "figure obstacle should force an H-cut between bands"
+                );
+            }
+            RegionKind::Leaf { .. } => panic!("expected a split when figure is present"),
+        }
+        // Without figures, the same layout *might* still find an H-cut (the
+        // gap from y≈127 to y≈400 is real), but the cut score with figures
+        // should be at least as strong. We mostly just want to confirm both
+        // paths return without panicking and the figure path produces a split.
+        let _ = region_no_fig;
+    }
+
+    #[test]
+    fn xy_cut_no_vertical_split_on_table_with_sparse_row() {
+        // Issue #400: a sparse row (3 of 8 cells) plus a note line drag the
+        // column peaks under the strong-peak floor, and the unprotected
+        // density V-cut used to transpose the table into column-major prose.
+        let cols = [48.0, 108.0, 190.0, 300.0, 360.0, 424.0, 486.0, 545.0];
+        let cells = [
+            "10/10/2024",
+            "IC-1000",
+            "WIDGET",
+            "Open",
+            "$1.00",
+            "$0.00",
+            "$2.00",
+            "N/A",
+        ];
+        // Widths must undershoot the column slots — the fill check keys on
+        // that whitespace.
+        let widths = [42.0, 30.0, 55.0, 22.0, 24.0, 22.0, 24.0, 15.0];
+        let mut items = Vec::new();
+        let mut y = 100.0;
+        // Header + 2 full rows.
+        for i in 0..8 {
+            for r in 0..3 {
+                items.push(item_at(
+                    cells[i],
+                    cols[i],
+                    100.0 + r as f32 * 16.0,
+                    widths[i],
+                    9.0,
+                ));
+            }
+        }
+        y += 3.0 * 16.0;
+        // Sparse row: only columns 0, 1, 3 populated.
+        for i in [0usize, 1, 3] {
+            items.push(item_at(cells[i], cols[i], y, widths[i], 9.0));
+        }
+        y += 22.0;
+        // Free-text note under the Description column.
+        items.push(item_at(
+            "note text spanning a while here",
+            190.0,
+            y,
+            220.0,
+            9.0,
+        ));
+        y += 22.0;
+        // 2 more full rows.
+        for _ in 0..2 {
+            for i in 0..8 {
+                items.push(item_at(cells[i], cols[i], y, widths[i], 9.0));
+            }
+            y += 16.0;
+        }
+        let region = xy_cut(&items, 612.0, 792.0, &[]);
+        assert!(
+            !has_vertical_split(&region),
+            "table region must not be V-cut into column fragments"
+        );
+    }
+
+    fn has_vertical_split(region: &Region) -> bool {
+        match &region.kind {
+            RegionKind::Split { axis, children } => {
+                *axis == CutAxis::Vertical || children.iter().any(has_vertical_split)
+            }
+            RegionKind::Leaf { .. } => false,
+        }
+    }
+
+    fn two_column_body(items: &mut Vec<ProjectedTextItem>, y0: f32) {
+        // Left column at x≈50..280, right column at x≈320..550, sharing y-bands.
+        for row in 0..8 {
+            let y = y0 + row as f32 * 14.0;
+            items.push(item_at("left column body text here", 50.0, y, 230.0, 12.0));
+            items.push(item_at(
+                "right column body text here",
+                320.0,
+                y,
+                230.0,
+                12.0,
+            ));
+        }
+    }
+
+    #[test]
+    fn spanning_line_above_columns_is_peeled_to_reveal_gutter() {
+        // A single centered line that crosses the gutter (x 160..450, gutter
+        // ≈300) sits above a clean two-column body. The spanning line straddles
+        // the gutter so the body can't V-cut until it's peeled. The rescue in
+        // the min-lines guard must allow the (finite-score) H-cut that isolates
+        // the spanning line, after which the body splits into columns.
+        let mut items = vec![item_at(
+            "Centered Spanning Author Line",
+            160.0,
+            100.0,
+            290.0,
+            12.0,
+        )];
+        two_column_body(&mut items, 140.0);
+        let region = xy_cut(&items, 612.0, 792.0, &[]);
+        assert!(
+            has_vertical_split(&region),
+            "spanning line should be peeled so the two-column body V-cuts"
+        );
+    }
+
+    #[test]
+    fn single_column_caption_is_not_peeled_into_columns() {
+        // A short centered line that sits entirely within the left column
+        // (x 60..200, never crossing the gutter) must NOT trigger the spanning
+        // rescue — it's a caption in running prose, not a column-straddling
+        // banner. The body below it is genuinely single-column.
+        let mut items = vec![item_at("Short caption", 60.0, 100.0, 140.0, 12.0)];
+        for row in 0..8 {
+            let y = 140.0 + row as f32 * 14.0;
+            items.push(item_at(
+                "single column running body text",
+                50.0,
+                y,
+                230.0,
+                12.0,
+            ));
+        }
+        let region = xy_cut(&items, 612.0, 792.0, &[]);
+        assert!(
+            !has_vertical_split(&region),
+            "single-column caption must not be carved into columns"
+        );
     }
 
     #[test]
@@ -2949,9 +5874,18 @@ mod tests {
     fn project_pages_to_grid_handles_page_with_no_text_items() {
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
+            content_bounds: None,
             text_items: Vec::new(),
+            graphics: Vec::new(),
+            vector_graphics: None,
+            struct_nodes: Vec::new(),
+            image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
         }];
 
         let parsed = project_pages_to_grid(pages);
@@ -2966,8 +5900,10 @@ mod tests {
         let y = 50.25;
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
+            content_bounds: None,
             text_items: vec![
                 TextItem {
                     text: "A".to_string(),
@@ -2986,6 +5922,13 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            graphics: Vec::new(),
+            vector_graphics: None,
+            struct_nodes: Vec::new(),
+            image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
         }];
 
         let parsed = project_pages_to_grid(pages);
@@ -3002,11 +5945,77 @@ mod tests {
     }
 
     #[test]
+    fn project_pages_to_grid_concatenates_word_boxes_when_items_merge() {
+        // Regression for #361: two items that merge into one must carry both
+        // items' per-word sub-boxes. The item text was concatenated but the
+        // second item's `words` were silently dropped, truncating `words`.
+        let y = 50.25;
+        let pages = vec![Page {
+            page_number: 1,
+            page_label: None,
+            page_width: 612.0,
+            page_height: 792.0,
+            content_bounds: None,
+            text_items: vec![
+                TextItem {
+                    text: "A".to_string(),
+                    x: 10.0,
+                    y,
+                    width: 10.0,
+                    height: 8.0,
+                    words: vec![WordBox {
+                        text: "A".to_string(),
+                        x: 10.0,
+                        y,
+                        width: 10.0,
+                        height: 8.0,
+                    }],
+                    ..Default::default()
+                },
+                TextItem {
+                    text: "B".to_string(),
+                    x: 24.0,
+                    y: y + 0.01,
+                    width: 8.0,
+                    height: 7.5,
+                    words: vec![WordBox {
+                        text: "B".to_string(),
+                        x: 24.0,
+                        y: y + 0.01,
+                        width: 8.0,
+                        height: 7.5,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            graphics: Vec::new(),
+            vector_graphics: None,
+            struct_nodes: Vec::new(),
+            image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
+        }];
+
+        let parsed = project_pages_to_grid(pages);
+        let item = parsed[0]
+            .text_items
+            .iter()
+            .find(|item| item.text == "A B")
+            .expect("merged text item");
+
+        let word_texts: Vec<&str> = item.words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(word_texts, vec!["A", "B"]);
+    }
+
+    #[test]
     fn project_pages_to_grid_unions_original_bbox_when_continuous_items_merge() {
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
+            content_bounds: None,
             text_items: vec![
                 TextItem {
                     text: "ab".to_string(),
@@ -3025,19 +6034,64 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            graphics: Vec::new(),
+            vector_graphics: None,
+            struct_nodes: Vec::new(),
+            image_refs: Vec::new(),
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
         }];
 
         let parsed = project_pages_to_grid(pages);
         let item = parsed[0]
             .text_items
             .iter()
-            .find(|item| item.text == "abcd")
+            .find(|item| item.text == "ab cd")
             .expect("merged continuous text item");
 
         assert!((item.x - 40.0).abs() < 0.001);
         assert!((item.y - 100.0).abs() < 0.001);
         assert!((item.width - 22.5).abs() < 0.01);
         assert!((item.height - 9.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn restacked_rotated_groups_do_not_compound_canvas_offsets() {
+        // Restacked 90° labels alternating with off-axis markers (map exports) must
+        // grow the canvas linearly, not double per label.
+        let page_height = 4000.0;
+        let pairs = 30;
+        let mut items = vec![item_at("heading", 100.0, 40.0, 200.0, 12.0)];
+        for i in 0..pairs {
+            let (x, y) = (200.0 + 60.0 * i as f32, 150.0 + 100.0 * i as f32);
+            let mut marker = item_at("m", x - 30.0, y, 6.0, 6.0);
+            marker.item.rotation = 30.0 + i as f32;
+            items.push(marker);
+            let mut label = item_at("label", x, y, 10.0, 22.0);
+            label.item.rotation = 90.0;
+            items.push(label);
+        }
+
+        handle_rotation_reading_order(&mut items, page_height);
+
+        let bottom = items
+            .iter()
+            .map(|p| p.item.y + p.item.height)
+            .fold(f32::MIN, f32::max);
+        let linear_bound = pairs as f32 * 3.0 * (page_height + 2000.0);
+        assert!(
+            bottom.is_finite() && bottom < linear_bound,
+            "canvas bottom {bottom} exceeds linear bound {linear_bound}"
+        );
+    }
+
+    #[test]
+    fn xy_bucket_size_caps_histogram_length() {
+        assert_eq!(xy_bucket_pt(792.0), XY_BUCKET_PT);
+        assert_eq!(xy_bucket_pt(2.0 * 65_536.0), XY_BUCKET_PT);
+        let runaway = 3.0e9_f32;
+        assert!((runaway / xy_bucket_pt(runaway)).ceil() as usize <= XY_MAX_BUCKETS);
     }
 
     #[test]

@@ -69,14 +69,19 @@ Outputs:
 Measures parse latency and memory usage across providers.
 
 ```bash
-lp-benchmark document.pdf --providers pymupdf liteparse --runs 20
+lp-benchmark ./documents --providers pymupdf liteparse --warmup-runs 0
 ```
+
+Takes a **directory** of PDFs (searched recursively), not a single file.
 
 Options:
 - `--providers` — Providers to benchmark (default: all local providers)
-- `--runs` — Number of benchmark runs per provider (default: 10)
-- `--warmup` — Number of warmup runs (default: 1)
+- `--warmup-runs` — Full passes over the corpus before timing starts (default: 5).
+  Each warmup run parses **every** document, so on a large corpus this dominates
+  wall time; use `0` for a quick measurement.
 - `--output` — Path to save JSON results
+
+Reports per-document latency plus TOTAL / AVG-per-doc / MS-per-page rows.
 
 ## Parser Providers
 

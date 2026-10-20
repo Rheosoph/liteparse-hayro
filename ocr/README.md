@@ -6,18 +6,19 @@ These servers allow you to use alternative OCR engines instead of the built-in T
 
 ## Why Use an External OCR Server?
 
-| Feature | Tesseract.js (built-in) | EasyOCR | PaddleOCR |
-|---------|-------------------------|---------|-----------|
-| Setup | Zero (included) | uv | uv |
-| Speed | Moderate | Moderate | Fast (2-3x) |
-| Accuracy (Latin) | Good | Good | Good |
-| Accuracy (CJK) | Fair | Good | Excellent |
-| Languages | 100+ | 80+ | 80+ |
-| Memory | In-process | Separate | Separate |
+| Feature | Tesseract.js (built-in) | EasyOCR | PaddleOCR | Surya |
+|---------|-------------------------|---------|-----------|-------|
+| Setup | Zero (included) | uv | uv | uv |
+| Speed | Moderate | Moderate | Fast (2-3x) | Moderate (GPU recommended) |
+| Accuracy (Latin) | Good | Good | Good | Excellent |
+| Accuracy (CJK) | Fair | Good | Excellent | Excellent |
+| Languages | 100+ | 80+ | 80+ | 91 |
+| Memory | In-process | Separate | Separate | Separate |
 
 **Recommendations:**
 - **Quick start**: Use built-in Tesseract (no setup)
 - **Asian languages**: Use PaddleOCR (best CJK support)
+- **Multilingual / broad scripts**: Use Surya (strong multilingual accuracy)
 - **General use**: EasyOCR (good balance)
 
 ## Available Servers
@@ -34,6 +35,12 @@ Flask server wrapping PaddleOCR library.
 - Excellent for Chinese, Japanese, Korean
 - 2-3x faster than EasyOCR
 
+### [suryaocr/](./suryaocr/)
+FastAPI server wrapping Surya OCR 2.
+- Port: **8830**
+- Multilingual foundation model (90+ languages)
+- Block-level output; GPU recommended
+
 ## Quick Start
 
 ```bash
@@ -43,6 +50,10 @@ uv run server.py
 
 # OR start PaddleOCR server
 cd ocr/paddleocr
+uv run server.py
+
+# OR start Surya OCR server
+cd ocr/suryaocr
 uv run server.py
 ```
 

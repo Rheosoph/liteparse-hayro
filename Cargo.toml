@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
+# `crates/pdfium` and `crates/pdfium-sys` are upstream's PDFium bindings. This
+# fork renders and extracts with hayro (see `crates/liteparse/src/pdfium_compat`)
+# and does not build them; they stay in the tree so upstream changes to them
+# merge without conflicts.
 members = [
-    "crates/pdfium-sys",
-    "crates/pdfium",
     "crates/liteparse",
     "crates/liteparse-napi",
     "crates/liteparse-python",

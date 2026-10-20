@@ -45,6 +45,7 @@ temp/
 !integration_tests_data/receipt.png
 !integration_tests_data/sample3.docx.doc
 !integration_tests_data/sample.pdf
+!integration_tests_data/filled_acroform.pdf
 deno.json
 
 # Python files

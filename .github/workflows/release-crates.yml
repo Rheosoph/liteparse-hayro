@@ -81,10 +81,12 @@ jobs:
             os: ubuntu-22.04
             artifact: lit-linux-x64
             pdfium-dylib: libpdfium.so
+            use-glibc-container: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
             artifact: lit-linux-arm64
             pdfium-dylib: libpdfium.so
+            use-glibc-container: true
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: lit-darwin-arm64
@@ -112,7 +114,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.use-glibc-container
         run: |
           sudo apt-get update
           sudo apt-get install -y libtesseract-dev libleptonica-dev
@@ -138,7 +140,21 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build
+        if: ${{ !matrix.use-glibc-container }}
         run: cargo build --release --target ${{ matrix.target }} -p liteparse
+
+      - name: Build (glibc container)
+        if: ${{ matrix.use-glibc-container }}
+        run: |
+          chmod +x scripts/build-glibc-cli.sh
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/work \
+            -v "$HOME/.cargo/registry":/root/.cargo/registry \
+            -v "$HOME/.cargo/git":/root/.cargo/git \
+            -v "$HOME/.cache/pdfium-rs":/root/.cache/pdfium-rs \
+            -w /work \
+            node:20-bullseye \
+            /work/scripts/build-glibc-cli.sh ${{ matrix.target }}
 
       - name: Stage binary and pdfium (Unix)
         if: runner.os != 'Windows'

@@ -58,6 +58,9 @@ lit parse document.pdf -o output.txt
 # Get structured JSON with bounding boxes
 lit parse document.pdf --format json -o output.json
 
+# Render to Markdown (headings, tables, lists, images, links)
+lit parse document.pdf --format markdown -o output.md
+
 # Parse only specific pages
 lit parse document.pdf --target-pages "1-5,10,15-20"
 ```
@@ -80,9 +83,12 @@ lit screenshot document.pdf -o ./screenshots
 
 ## Next steps
 
+- [Markdown output](/liteparse/guides/markdown/): Render documents to clean, structured Markdown.
+- [Extraction options](/liteparse/guides/extraction/): Opt in to embedded images, vector graphics, annotations, form fields, and structure trees.
 - [Library usage](/liteparse/guides/library-usage/): Use LiteParse programmatically from TypeScript or Python.
 - [OCR configuration](/liteparse/guides/ocr/): Configure Tesseract, use an external OCR server, or bring your own.
 - [Multi-format support](/liteparse/guides/multi-format/): Parse DOCX, XLSX, PPTX, images, and more.
+- [Document complexity](/liteparse/guides/complexity/): Check whether a document needs OCR / heavy processing before parsing, and route accordingly.
 - [Browser usage (WASM)](/liteparse/guides/browser-usage/): Run LiteParse entirely in the browser.
 - [Agent skill](/liteparse/guides/agent-skill/): Add LiteParse as a skill for coding agents.
 - [CLI reference](/liteparse/cli-reference/): Complete command and option reference.

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use super::{OcrEngine, OcrOptions, OcrResult};
-use tesseract_rs::{TessPageIteratorLevel, TesseractAPI};
+use tesseract_rs::{TessPageIteratorLevel, TessPageSegMode, TesseractAPI};
 
 const TESSDATA_BASE_URL: &str = "https://github.com/tesseract-ocr/tessdata_best/raw/main";
 
@@ -15,7 +15,7 @@ impl TesseractOcrEngine {
         Self { tessdata_path }
     }
 
-    fn normalize_language(lang: &str) -> &str {
+    fn normalize_language_code(lang: &str) -> &str {
         match lang.to_lowercase().trim() {
             "en" => "eng",
             "fr" => "fra",
@@ -32,14 +32,31 @@ impl TesseractOcrEngine {
             "hi" => "hin",
             "th" => "tha",
             "vi" => "vie",
-            _ => lang,
+            _ => lang.trim(),
         }
+    }
+
+    /// Normalize a tesseract language spec, which may be a single code or a
+    /// `+`-separated list (e.g. `ita+eng`). Each component is normalized
+    /// independently and rejoined with `+`.
+    fn normalize_language(lang: &str) -> String {
+        lang.split('+')
+            .filter(|part| !part.trim().is_empty())
+            .map(Self::normalize_language_code)
+            .collect::<Vec<_>>()
+            .join("+")
     }
 }
 
 impl OcrEngine for TesseractOcrEngine {
     fn name(&self) -> &str {
         "tesseract"
+    }
+
+    // Tesseract binarizes internally (Leptonica/Otsu on luma), so a grayscale
+    // buffer is equivalent input at a third of the memory.
+    fn prefers_grayscale(&self) -> bool {
+        true
     }
 
     fn recognize<'a, 'b: 'a, 'c: 'a>(
@@ -67,11 +84,23 @@ impl OcrEngine for TesseractOcrEngine {
                 .or_else(|| std::env::var("TESSDATA_PREFIX").ok());
 
             let resolved_path = tessdata_path.unwrap_or_else(default_tessdata_dir);
-            ensure_traineddata(Path::new(&resolved_path), language).await?;
-            api.init(&resolved_path, language)?;
+            for code in language.split('+') {
+                ensure_traineddata(Path::new(&resolved_path), code).await?;
+            }
+            api.init(&resolved_path, &language)?;
 
-            // Set image from raw RGB bytes (3 bytes per pixel)
-            let bytes_per_pixel = 3;
+            // Match the tesseract CLI's default page segmentation mode (PSM_AUTO,
+            // i.e. 3). The C++ library's own default when SetPageSegMode is never
+            // called is PSM_SINGLE_BLOCK (6), which assumes the image is a single
+            // uniform block of text and performs poorly on full-page layouts.
+            api.set_page_seg_mode(TessPageSegMode::PSM_AUTO)?;
+
+            // Channels inferred from the buffer: 1 = grayscale, 3 = RGB.
+            let bytes_per_pixel = if width > 0 && height > 0 {
+                (image_data.len() / (width as usize * height as usize)).clamp(1, 4) as i32
+            } else {
+                3
+            };
             let bytes_per_line = width as i32 * bytes_per_pixel;
             api.set_image(
                 image_data,
@@ -80,6 +109,12 @@ impl OcrEngine for TesseractOcrEngine {
                 bytes_per_pixel,
                 bytes_per_line,
             )?;
+
+            // Tesseract can't infer DPI from a raw RGB buffer (there's no image
+            // header), so it falls back to a guess and warns. Tell it the actual
+            // render resolution so its internal point-size/threshold heuristics are
+            // correct. Must come after set_image, which resets the resolution.
+            api.set_source_resolution(options.dpi.round() as i32)?;
 
             api.recognize()?;
 
@@ -99,6 +134,7 @@ impl OcrEngine for TesseractOcrEngine {
                             text,
                             bbox: [left as f32, top as f32, right as f32, bottom as f32],
                             confidence: conf,
+                            polygon: None,
                         });
                     }
                 }
@@ -208,6 +244,25 @@ mod tests {
     fn test_normalize_language_passthrough_for_unknown() {
         assert_eq!(TesseractOcrEngine::normalize_language("eng"), "eng");
         assert_eq!(TesseractOcrEngine::normalize_language("xyz"), "xyz");
+    }
+
+    #[test]
+    fn test_normalize_language_multi() {
+        // `+`-separated specs normalize each component independently.
+        assert_eq!(TesseractOcrEngine::normalize_language("ita+eng"), "ita+eng");
+        assert_eq!(TesseractOcrEngine::normalize_language("it+en"), "ita+eng");
+        assert_eq!(
+            TesseractOcrEngine::normalize_language(" it + en "),
+            "ita+eng"
+        );
+        assert_eq!(TesseractOcrEngine::normalize_language("eng+xyz"), "eng+xyz");
+        // Empty components (leading/trailing/double `+`) are dropped.
+        assert_eq!(TesseractOcrEngine::normalize_language("eng+"), "eng");
+        assert_eq!(TesseractOcrEngine::normalize_language("+eng"), "eng");
+        assert_eq!(
+            TesseractOcrEngine::normalize_language("ita++eng"),
+            "ita+eng"
+        );
     }
 
     #[test]

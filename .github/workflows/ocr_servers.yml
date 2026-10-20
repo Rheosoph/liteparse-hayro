@@ -3,6 +3,9 @@ name: Validate OCR Servers
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   testing_paddleocr:
     runs-on: ubuntu-latest

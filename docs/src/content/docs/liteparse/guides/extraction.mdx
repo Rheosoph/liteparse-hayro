@@ -1,0 +1,501 @@
+---
+title: Extraction Options
+description: Opt-in flags that add images, vector graphics, annotations, form fields, structure trees, layout blocks, and typography metadata to LiteParse output.
+sidebar:
+  order: 3
+---
+
+By default, LiteParse returns text, geometry, and page metadata. Everything a PDF *can* carry beyond that (embedded images, vector art, annotations, form fields, tagged-structure trees, per-glyph typography) is **opt-in**, behind its own flag.
+
+This keeps the default output shape small, stable, and cheap to produce. It also means that if you're looking for data you know is in the file and don't see it in the output, you're probably missing a flag.
+
+> Each option costs parse time and output size. Turn on only what you consume.
+
+## Quick reference
+
+| Rust / Python / CLI | Node / WASM | Adds |
+|---------------------|-------------|------|
+| `extract_images` / `--extract-images` | `extractImages` | `images[]`, `image_error_count` |
+| `extract_vector_graphics` / `--extract-vector-graphics` | `extractVectorGraphics` | `pages[].vector_graphics` |
+| `extract_annotations` / `--extract-annotations` | `extractAnnotations` | `pages[].annotations` |
+| `extract_form_fields` / `--extract-form-fields` | `extractFormFields` | `pages[].form_fields` |
+| `extract_structure_tree` / `--extract-structure-tree` | `extractStructureTree` | `pages[].structure_tree` |
+| `extract_blocks` / `--extract-blocks` | `extractBlocks` | `pages[].blocks` |
+| `extract_content_bounds` / `--extract-content-bounds` | `extractContentBounds` | `pages[].content_bounds` |
+| `extract_xfa_packets` / `--extract-xfa-packets` | `extractXfaPackets` | `xfa_packets[]` |
+| `extract_text_metadata` / `--extract-text-metadata` | `extractTextMetadata` | extra keys on `text_items[]` |
+| `include_complexity` / `--complexity` | `includeComplexity` | `pages[].complexity` |
+| `emit_word_boxes` *(no CLI flag)* | `emitWordBoxes` | `TextItem.words` (bindings only) |
+
+One toggle is **on** by default: `extract_links` (`--no-links` to disable). See the [Markdown guide](/liteparse/guides/markdown/).
+
+## Enabling options
+
+<Tabs>
+<TabItem label="TypeScript" value="typescript">
+
+```typescript
+import { LiteParse } from "@llamaindex/liteparse";
+
+const parser = new LiteParse({
+  outputFormat: "json",
+  extractImages: true,
+  extractFormFields: true,
+  extractAnnotations: true,
+  extractTextMetadata: true,
+});
+
+const result = await parser.parse("form.pdf");
+```
+
+</TabItem>
+<TabItem label="Python" value="python">
+
+```python
+from liteparse import LiteParse
+
+parser = LiteParse(
+    output_format="json",
+    extract_images=True,
+    extract_form_fields=True,
+    extract_annotations=True,
+    extract_text_metadata=True,
+)
+
+result = parser.parse("form.pdf")
+```
+
+</TabItem>
+<TabItem label="Rust" value="rust">
+
+```rust
+use liteparse::{LiteParse, LiteParseConfig, OutputFormat};
+
+let config = LiteParseConfig {
+    output_format: OutputFormat::Json,
+    extract_images: true,
+    extract_form_fields: true,
+    extract_annotations: true,
+    extract_text_metadata: true,
+    ..Default::default()
+};
+
+let result = LiteParse::new(config).parse("form.pdf").await?;
+```
+
+</TabItem>
+<TabItem label="CLI" value="cli">
+
+```bash
+lit parse form.pdf --format json \
+  --extract-images \
+  --extract-form-fields \
+  --extract-annotations \
+  --extract-text-metadata
+```
+
+</TabItem>
+</Tabs>
+
+## Embedded images
+
+`extract_images` decodes embedded raster images and returns their bytes and metadata in a document-level `images` array. Pair it with `image_output_dir` to write each image to disk instead of holding it in memory.
+
+```bash
+lit parse report.pdf --format json --extract-images --image-output-dir ./images
+```
+
+```json
+{
+  "images": [
+    {
+      "id": "p1_i0",
+      "name": "image_p1_0.png",
+      "path": "./images/image_p1_0.png",
+      "page": 1,
+      "bbox": { "x": 72.0, "y": 118.5, "width": 240.0, "height": 160.0 },
+      "width": 800,
+      "height": 533,
+      "rotation": 0.0,
+      "format": "png"
+    }
+  ],
+  "image_error_count": 0
+}
+```
+
+Notes:
+
+- `image_output_dir` **requires** `extract_images` — setting it alone is a config error. `image_mode: "embed"` also implies extraction, for backwards compatibility.
+- `duplicate_of` is set when the same image appears more than once in the document; the duplicate points at the canonical entry's `id` rather than re-storing the pixels.
+- `image_error_count` counts images that failed to decode. It is omitted when zero.
+- This is separate from `image_mode`, which only controls how image *references* are written into markdown. See the [Markdown guide](/liteparse/guides/markdown/).
+
+## Vector graphics
+
+`extract_vector_graphics` reports the vector drawing operations on each page, split into filled/stroked `shapes` and straight `lines`. Useful for finding table rules, underlines, dividers, and chart geometry.
+
+```json
+{
+  "vector_graphics": {
+    "shapes": [
+      {
+        "bbox": { "x": 72.0, "y": 400.0, "width": 180.0, "height": 90.0 },
+        "stroke": true,
+        "stroke_color": "#000000",
+        "fill": false,
+        "has_curve": true
+      }
+    ],
+    "lines": [
+      {
+        "x1": 72.0, "y1": 512.0, "x2": 540.0, "y2": 512.0,
+        "stroke": true,
+        "stroke_width": 0.5,
+        "stroke_color": "#cccccc",
+        "fill": false
+      }
+    ]
+  }
+}
+```
+
+## Annotations
+
+`extract_annotations` returns PDF annotations per page — comments, highlights, and link targets.
+
+```json
+{
+  "annotations": [
+    {
+      "subtype": "Link",
+      "rect": { "x": 72.0, "y": 300.0, "width": 120.0, "height": 12.0 },
+      "uri": "https://example.com"
+    },
+    {
+      "subtype": "Highlight",
+      "contents": "check this figure",
+      "title": "Reviewer 2",
+      "created": "D:20260714093000Z",
+      "quadpoint_rects": [
+        { "x": 72.0, "y": 280.0, "width": 200.0, "height": 11.0 }
+      ]
+    }
+  ]
+}
+```
+
+Only `subtype` is always present; every other key is omitted when the annotation doesn't carry it.
+
+## Form fields
+
+`extract_form_fields` returns AcroForm widgets and their resolved values.
+
+```json
+{
+  "form_fields": [
+    {
+      "id": "f0",
+      "type": "text",
+      "page": 1,
+      "annotation_index": 0,
+      "widget_index": 0,
+      "field_flags": 0,
+      "name": "applicant_name",
+      "value": "Ada Lovelace",
+      "rect": { "x": 150.0, "y": 640.0, "width": 220.0, "height": 18.0 }
+    },
+    {
+      "id": "f1",
+      "type": "checkbox",
+      "page": 1,
+      "annotation_index": 1,
+      "widget_index": 0,
+      "field_flags": 0,
+      "name": "agree_terms",
+      "checked": true
+    }
+  ]
+}
+```
+
+> The widget type is serialized as `type` in JSON, and is `type` on the Node and Python objects. Radio groups and checkbox sets expose `control_count`/`control_index` to tie sibling widgets together, and choice fields expose `options`/`selected_options`.
+
+For **XFA**-based forms (a different, XML-based form technology), use `extract_xfa_packets` instead, which returns the raw XFA packets at document level.
+
+Related: `render_form_fields` draws filled-in field appearances into rendered rasters. It affects [screenshots](/liteparse/guides/visual-citations/) and OCR input pixels, not JSON keys.
+
+## Structure tree
+
+`extract_structure_tree` returns the tagged-PDF logical structure — the authoring-time document outline of paragraphs, headings, tables, and lists. Only present in PDFs that were actually tagged.
+
+```json
+{
+  "structure_tree": {
+    "roots": [
+      {
+        "type": "Document",
+        "children": [
+          {
+            "type": "H1",
+            "marked_content_ids": [0],
+            "actual_text": "Quarterly Report",
+            "children": []
+          },
+          {
+            "type": "P",
+            "marked_content_ids": [1, 2],
+            "children": []
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`marked_content_ids` join back to the `mcid` field on text items (available with `extract_text_metadata`), letting you map reconstructed text to its authored role.
+
+## Layout blocks
+
+`extract_blocks` returns the page decomposed into blocks — headings, paragraphs, list items, tables, code, rules, and figures — each with the region of the page it came from. This is the same classification the Markdown renderer runs on.
+
+```bash
+lit parse document.pdf --format json --extract-blocks
+```
+
+Only the fields that apply to a block's `kind` are present:
+
+```json
+{
+  "kind": "heading",
+  "text": "Quarterly Report",
+  "level": 1,
+  "bbox": { "x": 72.0, "y": 114.88, "width": 284.0, "height": 21.0 }
+}
+```
+
+| Field | Kinds | Meaning |
+|-------|-------|---------|
+| `kind` | all | `heading`, `paragraph`, `list_item`, `code`, `table`, `grid_fallback`, `rule`, `figure` |
+| `bbox` | all | Region occupied, in the same coordinate space as `text_items` |
+| `text` | `heading`, `paragraph`, `list_item` | Rendered text |
+| `level` | `heading`, `list_item` | Heading level 1–6, or list nesting depth |
+| `bold`, `italic` | `paragraph`, `list_item` | Set when the whole block is emphasized |
+| `ordered`, `marker` | `list_item` | Whether the list is ordered, and the marker as it appeared (`138.`, `iii)`, `•`) |
+| `lines`, `lang` | `code`, `grid_fallback` | Verbatim source lines, and a best-effort language hint |
+| `header`, `rows` | `table` | Cells, each with its own `text` and `bbox` |
+| `id`, `format` | `figure` | Matches the `img_{id}.{format}` target in Markdown output |
+
+`bbox` is the union of every source line that fed the block, so a wrapped heading or multi-line paragraph reports the whole band it occupies — not just its first line.
+
+### Tables
+
+Table cells are objects, not bare strings: each carries its own `bbox`, so a cell maps back to the region it was read from.
+
+```json
+{
+  "kind": "table",
+  "bbox": { "x": 67.9, "y": 511.1, "width": 458.4, "height": 111.0 },
+  "header": [
+    { "text": "Title of each class", "bbox": { "x": 132.7, "y": 511.1, "width": 64.0, "height": 8.0 } },
+    { "text": "Trading symbol(s)",   "bbox": { "x": 288.7, "y": 511.1, "width": 35.0, "height": 8.0 } }
+  ],
+  "rows": [
+    [
+      { "text": "Common Stock", "bbox": { "x": 67.9, "y": 522.4, "width": 193.0, "height": 9.5 } },
+      { "text": "AAPL",         "bbox": { "x": 293.8, "y": 522.4, "width": 24.0, "height": 9.5 } }
+    ]
+  ]
+}
+```
+
+For a ruled table, a cell's box is the drawn grid cell. For a borderless one, it is the extent of the spans the cell was built from. Cells that exist only to square off a ragged grid have no `bbox` — there is no ink behind them.
+
+Getting a table into a dataframe is then a two-line transform:
+
+<Tabs>
+<TabItem label="Python" value="python">
+
+```python
+import pandas as pd
+from liteparse import LiteParse
+
+result = LiteParse(extract_blocks=True).parse("10-k.pdf")
+
+for page in result.pages:
+    for block in page.blocks or []:
+        if block.kind == "table":
+            df = pd.DataFrame(
+                [[c.text for c in row] for row in block.rows],
+                columns=[c.text for c in block.header or []],
+            )
+```
+
+</TabItem>
+<TabItem label="TypeScript" value="typescript">
+
+```typescript
+import { LiteParse } from "@llamaindex/liteparse";
+
+const { pages } = await new LiteParse({ extractBlocks: true }).parse("10-k.pdf");
+
+for (const page of pages) {
+  for (const block of page.blocks ?? []) {
+    if (block.kind !== "table") continue;
+    const grid = [block.header ?? [], ...block.rows].map((r) => r.map((c) => c.text));
+  }
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Text metadata
+
+`extract_text_metadata` enriches every entry in `text_items[]` with typography detail. Without it, a text item carries only `text`, `x`, `y`, `width`, `height`, `font_name`, and `font_size`.
+
+```json
+{
+  "text": "Quarterly Report",
+  "x": 72.0, "y": 118.5, "width": 180.4, "height": 14.0,
+  "rotation": 0.0,
+  "font_name": "Helvetica-Bold",
+  "font_size": 14.0,
+  "font_height": 14.2,
+  "font_ascent": 11.1,
+  "font_descent": -3.1,
+  "font_weight": 700,
+  "text_width": 180.4,
+  "font_is_buggy": false,
+  "mcid": 0,
+  "fill_color": "#111111"
+}
+```
+
+`font_weight` and `fill_color` are the practical way to detect emphasis and headings yourself when you need more control than markdown output gives you. `font_is_buggy` flags fonts whose metrics LiteParse had to estimate — treat sizes from those items with suspicion.
+
+## Content bounds
+
+`extract_content_bounds` adds a `content_bounds` rect per page: the bounding box of actual content, ignoring the page's declared media box. Use it to crop whitespace or detect pages whose content sits far from the nominal page area.
+
+```json
+{ "content_bounds": { "x": 68.0, "y": 96.0, "width": 476.0, "height": 620.0 } }
+```
+
+## Word boxes
+
+`emit_word_boxes` splits each text item into per-word sub-boxes (`TextItem.words`), for word-level bounding-box attribution.
+
+This one is **library- and bindings-only**. Word boxes are deliberately excluded from `--format json`, because on a text-heavy document they dwarf the rest of the payload. There is no CLI flag; reach for it from Node, Python, Rust, or WASM.
+
+<Tabs>
+<TabItem label="TypeScript" value="typescript">
+
+```typescript
+const parser = new LiteParse({ emitWordBoxes: true });
+const result = await parser.parse("report.pdf");
+
+for (const item of result.pages[0].textItems) {
+  for (const word of item.words ?? []) {
+    console.log(word.text, word.x, word.y, word.width, word.height);
+  }
+}
+```
+
+</TabItem>
+<TabItem label="Python" value="python">
+
+```python
+parser = LiteParse(emit_word_boxes=True)
+result = parser.parse("report.pdf")
+
+for item in result.pages[0].text_items:
+    for word in item.words:
+        print(word.text, word.x, word.y, word.width, word.height)
+```
+
+</TabItem>
+</Tabs>
+
+## Options with no CLI flag
+
+A few config options are only reachable from the library and bindings:
+
+| Option | Description |
+|--------|-------------|
+| `emit_word_boxes` | Per-word sub-boxes (see above). |
+| `crop_box` | Restrict output to a sub-region of each page. A text item is kept only if it falls entirely inside. |
+| `skip_diagonal_text` | Drop text rotated more than 2° off the nearest right angle — watermarks and diagonal stamps. |
+| `page_orientation_corrections` | Counter-rotate specific pages before extraction, using angles from your own orientation classifier (see below). |
+| `detect_screenshot_rects` | Populate `rects` on screenshot results. |
+| `render_form_fields` | Draw form-field appearances into rendered pages. |
+| `ocr_failure_fatal` | When `false`, a systemic OCR failure returns partial results instead of erroring. Defaults to `true`. |
+| `ocr_hedge_delays_ms` | Request-hedging schedule for HTTP OCR servers. No effect on built-in Tesseract. |
+
+`crop_box` takes the fraction to crop from each side. It is an object in Node and WASM, and a `(top, right, bottom, left)` tuple in Python:
+
+<Tabs>
+<TabItem label="TypeScript" value="typescript">
+
+```typescript
+// Drop the top 10% and bottom 5% of every page
+const parser = new LiteParse({
+  cropBox: { top: 0.1, right: 0.0, bottom: 0.05, left: 0.0 },
+});
+```
+
+</TabItem>
+<TabItem label="Python" value="python">
+
+```python
+# (top, right, bottom, left)
+parser = LiteParse(crop_box=(0.1, 0.0, 0.05, 0.0))
+```
+
+</TabItem>
+</Tabs>
+
+### Correcting page orientation
+
+LiteParse honours a page's `/Rotate` entry, but a scanned page whose *content* is
+upside down or sideways carries no such hint: its text layer (or OCR raster) reads
+bottom-up, so reading order and label/value pairs come out inverted. If you run an
+orientation classifier on the rendered page, hand its verdict to
+`page_orientation_corrections`. Each entry names a 1-based page and the clockwise
+angle (`0`, `90`, `180` or `270`) by which that page's content appears rotated;
+LiteParse counter-rotates the page before extraction, so text coordinates, reading
+order, page dimensions, OCR rasters and screenshots all come out upright. Pages not
+listed, or past the end of the document, are left unchanged.
+
+<Tabs>
+<TabItem label="TypeScript" value="typescript">
+
+```typescript
+// Page 3 was scanned upside down, page 7 sideways (content rotated 90° clockwise)
+const parser = new LiteParse({
+  pageOrientationCorrections: [
+    { page: 3, angle: 180 },
+    { page: 7, angle: 90 },
+  ],
+});
+```
+
+</TabItem>
+<TabItem label="Python" value="python">
+
+```python
+# (page, angle) pairs
+parser = LiteParse(page_orientation_corrections=[(3, 180), (7, 90)])
+```
+
+</TabItem>
+</Tabs>
+
+## Next steps
+
+- [Document complexity](/liteparse/guides/complexity/): Route documents before you parse them.
+- [Markdown output](/liteparse/guides/markdown/): Images, links, and header/footer handling in markdown.
+- [Visual citations](/liteparse/guides/visual-citations/): Turn block and text-item boxes into highlights on the rendered page.
+- [CLI reference](/liteparse/cli-reference/): Every flag, per command.
+- [API reference](/liteparse/api/): Full `LiteParseConfig` field list.

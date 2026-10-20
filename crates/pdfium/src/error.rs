@@ -11,6 +11,8 @@ pub enum PdfiumError {
     UnsupportedSecurity,
     PageNotFound,
     OperationFailed,
+    /// The pdfium shared library could not be located or loaded.
+    LibraryUnavailable,
 }
 
 impl PdfiumError {
@@ -37,6 +39,7 @@ impl fmt::Display for PdfiumError {
             PdfiumError::UnsupportedSecurity => write!(f, "unsupported security handler"),
             PdfiumError::PageNotFound => write!(f, "page not found"),
             PdfiumError::OperationFailed => write!(f, "operation failed"),
+            PdfiumError::LibraryUnavailable => write!(f, "pdfium shared library unavailable"),
         }
     }
 }

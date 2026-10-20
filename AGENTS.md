@@ -30,7 +30,7 @@ liteparse/
 │   │       ├── projection.rs   # Spatial grid projection (layout reconstruction)
 │   │       ├── extract.rs      # Raw text extraction from PDFium
 │   │       ├── render.rs       # Page rendering / screenshots
-│   │       ├── conversion.rs   # Non-PDF format conversion (LibreOffice, ImageMagick)
+│   │       ├── conversion.rs   # Non-PDF format conversion (LibreOffice, image/resvg/usvg rust crates)
 │   │       ├── ocr_merge.rs    # Merging OCR results with native text
 │   │       ├── error.rs        # Error types
 │   │       ├── ocr/            # OCR engine implementations
@@ -68,7 +68,7 @@ liteparse/
 ## Data Flow
 
 1. **Input**: File path or raw bytes received (any supported format)
-2. **Conversion** (if needed): Non-PDF formats converted to PDF via LibreOffice/ImageMagick
+2. **Conversion** (if needed): Non-PDF formats converted to PDF via LibreOffice and image/resvg/usvg rust crates
 3. **PDF Loading**: PDFium extracts text items, images, metadata
 4. **OCR** (if enabled): Pages rendered and OCR'd for text-sparse areas
 5. **Grid Projection**: Spatial reconstruction of text layout using anchor system
@@ -106,7 +106,7 @@ OCR only runs on embedded images where text extraction failed, not the entire do
 Uses a default-first approach where users only override what they need. See `crates/liteparse/src/config.rs` for defaults.
 
 ### 6. Format Conversion via External Tools
-Rather than implementing format parsers, LiteParse converts non-PDF formats using system tools (LibreOffice, ImageMagick) into PDF. This provides broad format support with minimal code.
+Rather than implementing format parsers, LiteParse converts office file formats using system tools (LibreOffice) into PDF. This provides broad format support with minimal code.
 
 ## Common Tasks
 
@@ -124,6 +124,7 @@ Rather than implementing format parsers, LiteParse converts non-PDF formats usin
 Key files in `crates/liteparse/src/`:
 - `projection.rs` — Layout reconstruction (most complex)
 - `extract.rs` — Raw text item extraction from PDFium
+- `text_clip.rs` — Shared glyph visibility: PDFium clip points already include the object matrix; compose only ancestor form matrices and inherit ancestor clips.
 - `ocr_merge.rs` — Merging OCR and native text
 
 ### Adding CLI Options

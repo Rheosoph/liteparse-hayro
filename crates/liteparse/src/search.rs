@@ -13,6 +13,11 @@ pub struct SearchOptions {
 /// box and the matched text. Font metadata is taken from the first matched item.
 pub fn search_items(items: &[TextItem], options: &SearchOptions) -> Vec<TextItem> {
     let mut results = Vec::new();
+    // An empty phrase matches nothing. Without this guard, `str::contains("")`
+    // is always true, so every item would emit a spurious empty-text match.
+    if options.phrase.is_empty() {
+        return results;
+    }
     let normalize = |s: &str| -> String {
         if options.case_sensitive {
             s.to_string()
@@ -181,6 +186,20 @@ mod tests {
         let items = vec![make_item("foo bar", 0.0, 0.0, 40.0)];
         let opts = SearchOptions {
             phrase: "baz".into(),
+            case_sensitive: false,
+        };
+        assert_eq!(search_items(&items, &opts).len(), 0);
+    }
+
+    #[test]
+    fn empty_phrase_matches_nothing() {
+        let items = vec![
+            make_item("alpha", 0.0, 0.0, 30.0),
+            make_item("beta", 0.0, 20.0, 30.0),
+            make_item("gamma", 0.0, 40.0, 30.0),
+        ];
+        let opts = SearchOptions {
+            phrase: String::new(),
             case_sensitive: false,
         };
         assert_eq!(search_items(&items, &opts).len(), 0);

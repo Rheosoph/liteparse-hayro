@@ -50,7 +50,8 @@ Your server should map these to whatever format your underlying OCR engine expec
     {
       "text": "recognized text",
       "bbox": [x1, y1, x2, y2],
-      "confidence": 0.95
+      "confidence": 0.95,
+      "polygon": [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
     }
   ]
 }
@@ -62,8 +63,9 @@ Your server should map these to whatever format your underlying OCR engine expec
 |-------|------|-------------|
 | `results` | array | Array of text detection results |
 | `results[].text` | string | Recognized text content |
-| `results[].bbox` | [number, number, number, number] | Bounding box `[x1, y1, x2, y2]` where (x1,y1) is top-left and (x2,y2) is bottom-right |
+| `results[].bbox` | [number, number, number, number] | Axis-aligned bounding box `[x1, y1, x2, y2]` where (x1,y1) is top-left and (x2,y2) is bottom-right |
 | `results[].confidence` | number | Confidence score between 0.0 and 1.0 |
+| `results[].polygon` | [[number, number], ×4] | **Optional.** 4-point detection polygon ordered top-left → top-right → bottom-right → bottom-left **in the glyphs' upright reading frame**. Lets LiteParse recover rotation for vertical/sideways text. |
 
 ## Example
 
@@ -126,7 +128,7 @@ Always return axis-aligned bounding boxes as `[x1, y1, x2, y2]`:
 - `x2, y2` = bottom-right corner
 - `x2 > x1` and `y2 > y1`
 
-If your OCR engine returns rotated boxes or polygon coordinates, convert them to axis-aligned boxes by taking min/max coordinates.
+If your OCR engine returns rotated boxes or polygon coordinates, convert them to axis-aligned boxes by taking min/max coordinates. **Additionally**, you are encouraged to forward the raw 4-point polygon as `polygon` (TL → TR → BR → BL in the upright reading frame) — LiteParse uses it to detect vertical/sideways text (e.g. legal-document sidebars) and route it through its rotation reading-order handler instead of flattening it into body lines.
 
 ### Confidence Scores
 
@@ -145,6 +147,7 @@ See the `/ocr` directory for reference implementations:
 
 - `ocr/easyocr/` - Wrapper for EasyOCR
 - `ocr/paddleocr/` - Wrapper for PaddleOCR
+- `ocr/suryaocr/` - Wrapper for Surya OCR 2 (multilingual)
 
 ## Testing Your Server
 
@@ -230,6 +233,7 @@ LiteParse handles page splitting. Your server only needs to process single image
 - [ ] Returns JSON with `results` array
 - [ ] Each result has `text`, `bbox`, and `confidence`
 - [ ] Bounding boxes in `[x1, y1, x2, y2]` format
+- [ ] (Optional but recommended) `polygon` field with 4-point TL→TR→BR→BL polygon for rotated detections
 - [ ] Confidence normalized to 0.0-1.0 range
 - [ ] Returns 200 status on success
 - [ ] Returns appropriate error codes and messages

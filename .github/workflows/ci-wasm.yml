@@ -18,6 +18,9 @@ on:
       - 'scripts/edge-compat/**'
       - '.github/workflows/ci-wasm.yml'
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -48,6 +51,11 @@ jobs:
 
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked
+
+      - name: Test WASM OCR stages
+        env:
+          NODE_PATH: ${{ github.workspace }}/scripts/browser-compat/stage-test-support
+        run: wasm-pack test --node crates/liteparse-wasm --test ocr_stages
 
       - name: Build WASM package
         working-directory: packages/wasm
@@ -113,7 +121,13 @@ jobs:
           path: packages/wasm/pkg/
 
       - name: Install Miniflare
-        run: npm install miniflare@latest
+        # Pinned, NOT @latest: miniflare@latest currently resolves to a 5.x
+        # alpha whose `new Miniflare()` options schema replaced the 4.x
+        # single-worker form (`modules: [...]`) used by
+        # scripts/edge-compat/wasm-test.mjs with a nested `workers: [...]`
+        # shape. There is no root package.json/lockfile in this repo, so the
+        # version has to live here. Bump deliberately, re-running the test.
+        run: npm install --no-save miniflare@4.20260730.0
 
       - name: Run edge runtime parse test
         run: node scripts/edge-compat/wasm-test.mjs

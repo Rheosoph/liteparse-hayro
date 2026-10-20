@@ -53,7 +53,7 @@ flowchart LR
 
       subgraph Core["Rust Core"]
           direction TB
-          CONV["Format Conversion\nLibreOffice / ImageMagick"]
+          CONV["Format Conversion\nLibreOffice / image/resvg/usvg rust crates"]
           EXTRACT["Text Extraction\nPDFium C library"]
           OCR["Selective OCR\nTesseract / HTTP / Custom"]
           MERGE["OCR Merge\nNative text + OCR results"]
@@ -302,21 +302,8 @@ choco install libreoffice-fresh
 
 > _Windows 上可能需要把 LibreOffice 的 program 目录（通常是 `C:\Program Files\LibreOffice\program`）加入 PATH。_
 
-#### 图像（通过 ImageMagick）
+#### 图像
 - **支持格式**：`.jpg`、`.jpeg`、`.png`、`.gif`、`.bmp`、`.tiff`、`.webp`、`.svg`
-
-安装 ImageMagick 以启用图像转 PDF：
-
-```bash
-# macOS
-brew install imagemagick
-
-# Ubuntu/Debian
-apt-get install imagemagick
-
-# Windows
-choco install imagemagick.app
-```
 
 ## 环境变量
 

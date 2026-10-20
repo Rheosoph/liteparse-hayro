@@ -2,7 +2,7 @@
 title: OCR Configuration
 description: Configure OCR in LiteParse — built-in Tesseract, or bring your own via HTTP servers.
 sidebar:
-  order: 2
+  order: 5
 ---
 
 LiteParse uses OCR selectively — only on embedded images or pages where native text extraction didn't find text. This keeps parsing fast while still capturing text from scanned pages and embedded images.
@@ -100,6 +100,19 @@ python server.py
 lit parse document.pdf --ocr-server-url http://localhost:8828/ocr
 ```
 
+### Authenticated servers
+
+Pass extra HTTP headers on every OCR request with `--ocr-server-header`, repeating the flag for each header:
+
+```bash
+lit parse document.pdf \
+  --ocr-server-url https://ocr.internal/ocr \
+  --ocr-server-header "Authorization: Bearer $TOKEN" \
+  --ocr-server-header "X-Tenant: acme"
+```
+
+In the libraries this is `ocr_server_headers` / `ocrServerHeaders`, taking a map of header name to value. It has no effect unless an OCR server URL is set.
+
 ### Parallel OCR workers
 
 LiteParse OCRs multiple pages in parallel. By default, it uses one fewer worker than your CPU core count. Override this with:
@@ -126,6 +139,8 @@ Content-Type: multipart/form-data
 | `file` | binary | Yes | Image file (PNG, JPG, etc.) |
 | `language` | string | No | ISO 639-1 language code (default: `en`) |
 
+> **Watch the language code.** LiteParse forwards whatever `--ocr-language` is set to, which defaults to the Tesseract-style ISO 639-3 code `eng` — not `en`. Your server should accept both. The bundled EasyOCR and PaddleOCR servers do this by mapping `eng` → `en` before dispatch; do the same in a custom server, or pass `--ocr-language en` explicitly.
+
 **Response format:**
 
 ```json
@@ -133,7 +148,7 @@ Content-Type: multipart/form-data
   "results": [
     {
       "text": "recognized text",
-      "bbox": [x1, y1, x2, y2],
+      "bbox": [12, 40, 220, 62],
       "confidence": 0.95
     }
   ]
@@ -152,12 +167,12 @@ Each result contains:
 
 ```bash
 # Quick test with curl
-curl -X POST http://localhost:8080/ocr \
+curl -X POST http://localhost:8828/ocr \
   -F "file=@test.png" \
   -F "language=en" | jq .
 
 # Use with LiteParse
-lit parse document.pdf --ocr-server-url http://localhost:8080/ocr
+lit parse document.pdf --ocr-server-url http://localhost:8828/ocr
 ```
 
 ### Common Gotchas

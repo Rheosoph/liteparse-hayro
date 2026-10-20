@@ -24,7 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr-eng \
     ca-certificates \
     libreoffice \
-    imagemagick \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/lit /usr/local/bin/lit

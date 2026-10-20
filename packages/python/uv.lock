@@ -128,7 +128,7 @@ wheels = [
 
 [[package]]
 name = "liteparse"
-version = "2.0.0"
+version = "2.11.1"
 source = { editable = "." }
 
 [package.optional-dependencies]

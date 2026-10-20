@@ -2,7 +2,7 @@
 title: Visual Citations with Bounding Boxes
 description: Use bounding boxes and screenshots to show exactly where information was found in a document.
 sidebar:
-  order: 4
+  order: 7
 ---
 
 When building agents or RAG workflows, it is often not enough to parse text and call it done. Frequently, users and applications will require you to show _where_ that text came from.
@@ -11,24 +11,37 @@ LiteParse gives you spatial coordinates for every text item, plus page screensho
 
 ## How bounding boxes work
 
-When you parse a document with JSON output, each page includes **`textItems`** — every extracted text element with its position (`x`, `y`, `width`, `height`) and content.
+When you parse a document with JSON output, each page includes a list of text items — every extracted text element with its position (`x`, `y`, `width`, `height`) and content.
+
+```bash
+lit parse document.pdf --format json
+```
 
 ```json
-$ lit parse document.pdf --format json
 {
-  "pages": [{
-    "page": 1,
-    "width": 612,
-    "height": 792,
-    "text": "...",
-    "textItems": [
-      { "text": "Revenue grew 15%", "x": 72, "y": 200, "width": 150, "height": 12, ... }
-    ],
-  }]
+  "pages": [
+    {
+      "page": 1,
+      "width": 612,
+      "height": 792,
+      "text": "Revenue grew 15% ...",
+      "text_items": [
+        {
+          "text": "Revenue grew 15%",
+          "x": 72,
+          "y": 200,
+          "width": 150,
+          "height": 12
+        }
+      ]
+    }
+  ]
 }
 ```
 
 Coordinates are in **PDF points** (1 point = 1/72 inch). Origin is the top-left corner of the page, with X increasing right and Y increasing down.
+
+> JSON output is snake_case (`text_items`, `page`). The Node bindings use camelCase (`textItems`, `pageNum`) and Python uses snake_case (`text_items`, `page_num`). The examples below use each language's own naming.
 
 ## Library usage
 
@@ -112,9 +125,9 @@ async function main() {
   const query = "0°C to 70°C";
   const hitsByPage = new Map<number, Array<{ x: number; y: number; width: number; height: number }>>();
 
-  for (const page of result.json?.pages || []) {
+  for (const page of result.pages) {
     const matches = searchItems(page.textItems, { phrase: query });
-    if (matches.length) hitsByPage.set(page.page, matches);
+    if (matches.length) hitsByPage.set(page.pageNum, matches);
   }
 
   // Draw all highlights per page into a single image
@@ -184,3 +197,4 @@ From there, you (or an agent) can process the resulting JSON and screenshots as 
 - Use the same `dpi` value for both `parse()` and `screenshot()`. The default is `150` for both.
 - Page `width` and `height` in the JSON are in PDF points, matching the coordinate space. Use these if you need to normalize coordinates to percentages.
 - For multi-word phrase search, iterate `textItems` and check adjacent items — a phrase may span multiple text items.
+- To highlight a whole heading, paragraph, or table rather than individual words, parse with [`extract_blocks`](/liteparse/guides/extraction/#layout-blocks). Each block carries one `bbox` covering every line that fed it, so you can outline a region without stitching text items together yourself — and table cells carry their own boxes for cell-level citations.

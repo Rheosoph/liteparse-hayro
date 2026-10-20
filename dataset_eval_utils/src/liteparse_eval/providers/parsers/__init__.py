@@ -2,6 +2,7 @@ from .base import ParserProvider
 from .liteparse import LiteparseProvider
 from .markitdown import MarkItDownProvider
 from .opendataloader import OpenDataLoaderProvider
+from .pdf_inspector import PdfInspectorProvider
 from .pdftotext import PdfToTextProvider
 from .pymupdf import PyMuPDFProvider
 from .pymupdf4llm_md import PyMuPDF4LLMMarkdownProvider
@@ -13,6 +14,7 @@ __all__ = [
     "LiteparseProvider",
     "MarkItDownProvider",
     "OpenDataLoaderProvider",
+    "PdfInspectorProvider",
     "PdfToTextProvider",
     "PyMuPDFProvider",
     "PyMuPDF4LLMMarkdownProvider",

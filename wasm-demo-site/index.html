@@ -210,6 +210,11 @@
       word-break: normal;
     }
 
+    #output.wrap {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
     /* Stats bar */
     .stats {
       display: flex;
@@ -367,10 +372,12 @@
       <div class="controls">
         <label for="format-select">Output:</label>
         <select id="format-select">
+          <option value="markdown">Markdown</option>
           <option value="text">Plain Text</option>
           <option value="json">JSON (with bounding boxes)</option>
         </select>
         <div class="spacer"></div>
+        <button id="wrap-btn">Wrap: Off</button>
         <button id="copy-btn">Copy</button>
       </div>
       <pre id="output"></pre>
@@ -384,14 +391,14 @@
 <span class="cmt">// Initialize the WASM module</span>
 <span class="kw">await</span> <span class="fn">init</span>();
 
-<span class="cmt">// Create a parser instance</span>
-<span class="kw">const</span> <span class="const">parser</span> = <span class="kw">new</span> <span class="fn">LiteParse</span>({ <span class="const">outputFormat</span>: <span class="str">"json"</span> });
+<span class="cmt">// Create a parser instance (markdown output)</span>
+<span class="kw">const</span> <span class="const">parser</span> = <span class="kw">new</span> <span class="fn">LiteParse</span>({ <span class="const">outputFormat</span>: <span class="str">"markdown"</span> });
 
 <span class="cmt">// Parse PDF bytes (Uint8Array from File, fetch, etc.)</span>
 <span class="kw">const</span> <span class="const">bytes</span> = <span class="kw">new</span> <span class="fn">Uint8Array</span>(<span class="kw">await</span> file.<span class="fn">arrayBuffer</span>());
 <span class="kw">const</span> <span class="const">result</span> = <span class="kw">await</span> parser.<span class="fn">parse</span>(<span class="const">bytes</span>);
 
-console.<span class="fn">log</span>(<span class="const">result</span>.text);           <span class="cmt">// full document text</span>
+console.<span class="fn">log</span>(<span class="const">result</span>.text);           <span class="cmt">// rendered markdown</span>
 console.<span class="fn">log</span>(<span class="const">result</span>.pages[<span class="const">0</span>].textItems); <span class="cmt">// items with bounding boxes</span></pre>
     </div>
   </main>
@@ -413,8 +420,11 @@ console.<span class="fn">log</span>(<span class="const">result</span>.pages[<spa
     const fileInput = document.getElementById("pdf-input");
     const formatSelect = document.getElementById("format-select");
     const copyBtn = document.getElementById("copy-btn");
+    const wrapBtn = document.getElementById("wrap-btn");
 
-    let lastResult = null;
+    let currentFile = null;     // raw bytes of the loaded PDF
+    let currentName = "";
+    const resultCache = {};     // keyed by output format: "markdown" | "text" | "json"
 
     function setStatus(msg, type) {
       status.textContent = msg;
@@ -427,10 +437,10 @@ console.<span class="fn">log</span>(<span class="const">result</span>.pages[<spa
     let LiteParse;
     try {
       const mod = await import(
-        "https://cdn.jsdelivr.net/npm/@llamaindex/liteparse-wasm@2/pkg/liteparse_wasm.js"
+        "https://cdn.jsdelivr.net/npm/@llamaindex/liteparse-wasm@2.4/pkg/liteparse_wasm.js"
       );
       await mod.default(
-        "https://cdn.jsdelivr.net/npm/@llamaindex/liteparse-wasm@2/pkg/liteparse_wasm_bg.wasm"
+        "https://cdn.jsdelivr.net/npm/@llamaindex/liteparse-wasm@2.4/pkg/liteparse_wasm_bg.wasm"
       );
       LiteParse = mod.LiteParse;
       setStatus("Ready. Drop a PDF to parse.", "success");
@@ -465,38 +475,56 @@ console.<span class="fn">log</span>(<span class="const">result</span>.pages[<spa
       if (file) parseFile(file);
     });
 
-    // --- Parse ---
+    // --- Load a file (store bytes, then render the selected format) ---
     async function parseFile(file) {
       if (!LiteParse) {
         setStatus("WASM module not loaded yet.", "error");
         return;
       }
-
-      setStatus(`Parsing "${file.name}"...`, "loading");
+      currentFile = new Uint8Array(await file.arrayBuffer());
+      currentName = file.name;
+      for (const k in resultCache) delete resultCache[k];
       outputContainer.classList.remove("visible");
+      await renderOutput();
+    }
 
+    // Parse with a given output format, caching the result per format.
+    async function parseAs(format) {
+      if (resultCache[format]) return resultCache[format];
+      const t0 = performance.now();
+      const parser = new LiteParse({
+        ocrEnabled: false,
+        outputFormat: format,
+        quiet: true,
+      });
+      const result = await parser.parse(currentFile);
+      const elapsed = (performance.now() - t0) / 1000;
+      resultCache[format] = { result, elapsed };
+      return resultCache[format];
+    }
+
+    // --- Render output for the selected format ---
+    async function renderOutput() {
+      if (!currentFile) return;
+      const format = formatSelect.value;
+      setStatus(`Parsing "${currentName}"...`, "loading");
       try {
-        const t0 = performance.now();
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        const parser = new LiteParse({
-          ocrEnabled: false,
-          outputFormat: "json",
-          quiet: true,
-        });
-        const result = await parser.parse(bytes);
-        const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+        const { result, elapsed } = await parseAs(format);
 
-        lastResult = result;
-        setStatus(`Parsed ${result.pages.length} page(s) in ${elapsed}s`, "success");
-        renderOutput();
+        if (format === "json") {
+          output.textContent = JSON.stringify(result, null, 2);
+        } else {
+          // For "markdown" and "text", result.text holds the rendered output.
+          output.textContent = result.text;
+        }
 
+        setStatus(`Parsed ${result.pages.length} page(s) in ${elapsed.toFixed(2)}s`, "success");
         statsEl.innerHTML = [
           `<span class="stat"><strong>${result.pages.length}</strong> pages</span>`,
           `<span class="stat"><strong>${result.text.length.toLocaleString()}</strong> chars</span>`,
-          `<span class="stat"><strong>${elapsed}s</strong> elapsed</span>`,
-          `<span class="stat"><strong>${(bytes.length / 1024).toFixed(0)} KB</strong> file size</span>`,
+          `<span class="stat"><strong>${elapsed.toFixed(2)}s</strong> elapsed</span>`,
+          `<span class="stat"><strong>${(currentFile.length / 1024).toFixed(0)} KB</strong> file size</span>`,
         ].join("");
-
         outputContainer.classList.add("visible");
       } catch (err) {
         setStatus("Parse error: " + err.toString(), "error");
@@ -504,17 +532,12 @@ console.<span class="fn">log</span>(<span class="const">result</span>.pages[<spa
       }
     }
 
-    // --- Render output ---
-    function renderOutput() {
-      if (!lastResult) return;
-      if (formatSelect.value === "text") {
-        output.textContent = lastResult.text;
-      } else {
-        output.textContent = JSON.stringify(lastResult, null, 2);
-      }
-    }
-
     formatSelect.addEventListener("change", renderOutput);
+
+    wrapBtn.addEventListener("click", () => {
+      const wrapped = output.classList.toggle("wrap");
+      wrapBtn.textContent = wrapped ? "Wrap: On" : "Wrap: Off";
+    });
 
     copyBtn.addEventListener("click", () => {
       navigator.clipboard.writeText(output.textContent);

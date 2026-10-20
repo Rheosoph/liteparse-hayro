@@ -1,4 +1,5 @@
 import io
+import os
 import logging
 import traceback
 from typing import Any
@@ -23,13 +24,32 @@ class StatusResponse(BaseModel):
 
 class PaddleOCRServer:
     def __init__(self) -> None:
-        self.ocr: PaddleOCR = PaddleOCR(
-            lang="en",
+        self.ocr: PaddleOCR = self._make_ocr("en")
+        self.current_language: str = "en"
+
+    @staticmethod
+    def _make_ocr(language: str) -> PaddleOCR:
+        """Build a PaddleOCR 3.x pipeline.
+
+        PADDLE_DET_LIMIT_SIDE_LEN (default 1600) caps the long edge fed to the
+        text detector ("max" limit type). Large page renders (e.g. 3500x4500 px
+        scans at 150 DPI) otherwise take minutes and several GB on CPU; the
+        recognizer still crops from the full-resolution image.
+        """
+        kwargs: dict[str, Any] = dict(
+            lang=language,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
-            use_textline_orientation=True,
+            use_textline_orientation=os.environ.get("PADDLE_TEXTLINE_ORIENTATION", "1") not in ("0", "false"),
         )
-        self.current_language: str = "en"
+        limit = os.environ.get("PADDLE_DET_LIMIT_SIDE_LEN", "1600")
+        if limit and limit != "0":
+            kwargs["text_det_limit_side_len"] = int(limit)
+            kwargs["text_det_limit_type"] = "max"
+        threads = os.environ.get("PADDLE_CPU_THREADS")
+        if threads:
+            kwargs["cpu_threads"] = int(threads)
+        return PaddleOCR(**kwargs)
 
     @staticmethod
     def normalize_language(language: str) -> str:
@@ -62,12 +82,7 @@ class PaddleOCRServer:
                 # Initialize OCR if needed or language changed
                 if self.current_language != language:
                     # PaddleOCR 3.x parameters
-                    self.ocr = PaddleOCR(
-                        lang=language,
-                        use_doc_orientation_classify=False,
-                        use_doc_unwarping=False,
-                        use_textline_orientation=True,
-                    )
+                    self.ocr = self._make_ocr(language)
                     self.current_language = language
 
                 # Load image
@@ -103,16 +118,27 @@ class PaddleOCRServer:
                 res_data = (
                     result.get("res", result) if isinstance(result, dict) else result
                 )
-                # Extract texts, scores, and boxes from the result
+                # Extract texts, scores, axis-aligned boxes, and quad polygons.
+                # PaddleOCR exposes the 4-point detection polygons under
+                # ``rec_polys`` (or ``dt_polys`` upstream) in TL→TR→BR→BL order
+                # relative to each detection's upright reading frame. We forward
+                # them so LiteParse can recover the rotation of vertical
+                # sidebar text instead of treating it as a horizontal line.
                 if isinstance(res_data, dict):
                     texts = res_data.get("rec_texts", [])
                     scores = res_data.get("rec_scores", [])
                     boxes = res_data.get("rec_boxes", [])
+                    polys = res_data.get("rec_polys", res_data.get("dt_polys", []))
                 else:
                     # Fallback for result object with attributes
                     texts = getattr(res_data, "rec_texts", []) or []
                     scores = getattr(res_data, "rec_scores", []) or []
                     boxes = getattr(res_data, "rec_boxes", []) or []
+                    polys = (
+                        getattr(res_data, "rec_polys", None)
+                        or getattr(res_data, "dt_polys", None)
+                        or []
+                    )
 
                 # Convert numpy arrays to lists if needed
                 if hasattr(texts, "tolist"):
@@ -121,6 +147,8 @@ class PaddleOCRServer:
                     scores = scores.tolist()
                 if hasattr(boxes, "tolist"):
                     boxes = boxes.tolist()
+                if hasattr(polys, "tolist"):
+                    polys = polys.tolist()
 
                 # Combine them - they should be parallel arrays
                 for i in range(len(texts)):
@@ -139,9 +167,27 @@ class PaddleOCRServer:
                     else:
                         bbox = [0, 0, 0, 0]
 
-                    formatted.append(
-                        {"text": text, "bbox": bbox, "confidence": confidence}
-                    )
+                    polygon = None
+                    if i < len(polys):
+                        poly = polys[i]
+                        if hasattr(poly, "tolist"):
+                            poly = poly.tolist()
+                        # Expect a 4×2 sequence; coerce to floats and validate
+                        # shape before forwarding.
+                        if len(poly) == 4 and all(len(pt) == 2 for pt in poly):
+                            polygon = [[float(pt[0]), float(pt[1])] for pt in poly]
+                        # When rec_boxes is missing/zero (rotated detections in
+                        # some PaddleOCR builds only populate rec_polys), derive
+                        # an axis-aligned fallback from the polygon.
+                        if polygon is not None and bbox == [0, 0, 0, 0]:
+                            xs = [pt[0] for pt in polygon]
+                            ys = [pt[1] for pt in polygon]
+                            bbox = [min(xs), min(ys), max(xs), max(ys)]
+
+                    item = {"text": text, "bbox": bbox, "confidence": confidence}
+                    if polygon is not None:
+                        item["polygon"] = polygon
+                    formatted.append(item)
 
             return OcrResponse(results=formatted)
 

@@ -7,6 +7,7 @@
  * Requires: playwright (npx playwright install chromium)
  * Expects:  packages/wasm/pkg/ to contain the built WASM files
  *           demo/docs/apple-10k-2024.pdf to exist
+ * Set PLAYWRIGHT_CHROMIUM_EXECUTABLE to use an existing browser executable.
  */
 
 import { createServer } from "node:http";
@@ -67,35 +68,58 @@ async function main() {
 
   let browser;
   try {
-    browser = await chromium.launch();
+    browser = await chromium.launch({
+      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE,
+    });
     const page = await browser.newPage();
 
-    // Collect console errors
     const errors = [];
-    page.on("pageerror", (err) => errors.push(err.message));
+    let reportBrowserFailure;
+    const browserFailure = new Promise((resolvePromise) => {
+      reportBrowserFailure = resolvePromise;
+    });
+    page.on("pageerror", (error) => {
+      errors.push(error.message);
+      reportBrowserFailure(error);
+    });
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        const error = new Error(message.text());
+        errors.push(error.message);
+        reportBrowserFailure(error);
+      }
+    });
 
     console.log("Navigating to test page...");
     await page.goto(`${baseUrl}/scripts/browser-compat/wasm-test.html`);
 
-    // Wait for either #result or #error to appear (up to 120s for large PDFs)
-    await page.waitForSelector("#result[style*='block'], #error[style*='block']", {
-      timeout: 120_000,
-    });
+    const completion = page
+      .waitForSelector("#result[style*='block'], #error[style*='block']", { timeout: 120_000 })
+      .then(() => null)
+      .catch((error) => error);
+    const failure = await Promise.race([completion, browserFailure]);
+    if (failure) throw failure;
 
     const errorText = await page.locator("#error").textContent();
     if (errorText) {
-      console.error(`FAIL: ${errorText}`);
-      if (errors.length) console.error("Console errors:", errors);
-      process.exit(1);
+      throw new Error(`${errorText}${errors.length ? `\nPage errors: ${errors.join("\n")}` : ""}`);
     }
 
     const resultText = await page.locator("#result").textContent();
     const pages = await page.locator("#result").getAttribute("data-pages");
     const textLength = await page.locator("#result").getAttribute("data-text-length");
+    const ocrCallbacks = await page.locator("#result").getAttribute("data-ocr-callbacks");
+    const ocrBytes = await page.locator("#result").getAttribute("data-ocr-bytes");
+    const ocrMaxConcurrency = await page.locator("#result").getAttribute("data-ocr-max-concurrency");
+    const ocrFailureCases = await page.locator("#result").getAttribute("data-ocr-failure-cases");
 
     console.log(`PASS: ${resultText}`);
     console.log(`  Pages: ${pages}`);
     console.log(`  Text length: ${textLength}`);
+    console.log(`  OCR callback calls: ${ocrCallbacks}`);
+    console.log(`  OCR input bytes: ${ocrBytes}`);
+    console.log(`  OCR maximum concurrency: ${ocrMaxConcurrency}`);
+    console.log(`  OCR failure cases: ${ocrFailureCases}`);
 
     if (errors.length) {
       console.warn("Browser console errors (non-fatal):", errors);
@@ -106,7 +130,7 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("Test runner failed:", err);
+main().catch((error) => {
+  console.error("Test runner failed:", error);
   process.exit(1);
 });

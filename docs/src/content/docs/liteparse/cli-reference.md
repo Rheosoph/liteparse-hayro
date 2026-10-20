@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-LiteParse provides the `lit` CLI with three commands: `parse`, `batch-parse`, and `screenshot`. The CLI is the same whether installed via `npm`, `pip`, or built from Rust source.
+LiteParse provides the `lit` CLI with four commands: `parse`, `batch-parse`, `screenshot`, and `is-complex`. The CLI is the same whether installed via `npm`, `pip`, or built from Rust source.
 
 ## `lit parse`
 
@@ -26,10 +26,15 @@ lit parse [options] <file>
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-o, --output <file>` | Write output to a file instead of stdout | — |
-| `--format <format>` | Output format: `json` or `text` | `text` |
+| `--format <format>` | Output format: `json`, `text`, or `markdown` | `text` |
+| `--image-mode <mode>` | Markdown image handling: `off`, `placeholder`, or `embed` | `placeholder` |
+| `--image-output-dir <dir>` | Directory to write extracted images to. Requires `--extract-images` (or `--image-mode embed`, which implies it) | — |
+| `--no-links` | Emit link anchor text as plain text (no `[text](url)`) in markdown | — |
+| `--keep-headers-footers` | Keep running header/footer chrome in markdown instead of stripping it | — |
 | `--no-ocr` | Disable OCR entirely | — |
 | `--ocr-language <lang>` | OCR language code (Tesseract format) | `eng` |
 | `--ocr-server-url <url>` | HTTP OCR server URL | — (uses Tesseract) |
+| `--ocr-server-header <header>` | Extra HTTP header for OCR server requests, as `"Name: Value"`. Repeatable | — |
 | `--tessdata-path <path>` | Path to tessdata directory | — (uses `TESSDATA_PREFIX` env var) |
 | `--num-workers <n>` | Pages to OCR in parallel | CPU cores - 1 |
 | `--max-pages <n>` | Maximum pages to parse | `1000` |
@@ -39,6 +44,23 @@ lit parse [options] <file>
 | `--password <password>` | Password for encrypted/protected documents | — |
 | `-q, --quiet` | Suppress progress output | — |
 
+### Extraction options
+
+By default, JSON output contains only text, geometry, and page metadata. Each option below is **off by default** and adds a new key to the JSON output. Enable only what you need — every one of them costs parse time and output size.
+
+| Option | Adds to JSON | Description |
+|--------|--------------|-------------|
+| `--extract-images` | `images[]`, `image_error_count` | Extract embedded raster image bytes and metadata. Pair with `--image-output-dir` to write files to disk |
+| `--extract-vector-graphics` | `pages[].vector_graphics` | Vector shapes and lines (`{ shapes, lines }`) with bounding boxes, stroke/fill colors |
+| `--extract-annotations` | `pages[].annotations` | PDF annotations: subtype, contents, timestamps, rects, link URIs |
+| `--extract-form-fields` | `pages[].form_fields` | AcroForm widgets: type, name, value, flags, options, rect |
+| `--extract-structure-tree` | `pages[].structure_tree` | Tagged-PDF logical structure tree (`{ roots }`), including per-element attributes |
+| `--extract-blocks` | `pages[].blocks` | Classified layout blocks in reading order (headings, paragraphs, list items, tables with per-cell boxes, code, rules, figures), each with a bounding box |
+| `--extract-content-bounds` | `pages[].content_bounds` | Bounding box of actual content on the page, as a `Rect` |
+| `--extract-xfa-packets` | `xfa_packets[]` (document level) | Raw XFA packets from XFA-based forms |
+| `--extract-text-metadata` | extra keys on each `text_items[]` entry | Rich per-item typography: `font_height`, `font_ascent`, `font_descent`, `font_weight`, `text_width`, `font_is_buggy`, `mcid`, `fill_color`, `stroke_color`, plus `rotation` |
+| `--complexity` | `pages[].complexity` | Per-page complexity signals, including the nested `layout` object. See the [Document Complexity guide](/liteparse/guides/complexity/) |
+
 ### Examples
 
 ```bash
@@ -47,6 +69,25 @@ lit parse report.pdf
 
 # JSON output with bounding boxes
 lit parse report.pdf --format json -o report.json
+
+# Markdown output (headings, tables, lists, images, links)
+lit parse report.pdf --format markdown -o report.md
+
+# Markdown with extracted images written to disk
+lit parse report.pdf --format markdown --extract-images --image-output-dir ./images
+
+# Pull form fields and annotations out of a filled-in PDF
+lit parse form.pdf --format json --extract-form-fields --extract-annotations
+
+# Rich typography metadata on every text item
+lit parse report.pdf --format json --extract-text-metadata
+
+# Inline complexity signals (including layout) alongside the parse
+lit parse report.pdf --format json --complexity
+
+# Authenticated OCR server
+lit parse scan.pdf --ocr-server-url https://ocr.internal/ocr \
+  --ocr-server-header "Authorization: Bearer $TOKEN"
 
 # Parse pages 1-5 only, no OCR
 lit parse report.pdf --target-pages "1-5" --no-ocr
@@ -85,10 +126,11 @@ lit batch-parse [options] <input-dir> <output-dir>
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--format <format>` | Output format: `json` or `text` | `text` |
+| `--format <format>` | Output format: `json`, `text`, or `markdown` | `text` |
 | `--no-ocr` | Disable OCR entirely | — |
 | `--ocr-language <lang>` | OCR language code | `eng` |
 | `--ocr-server-url <url>` | HTTP OCR server URL | — (uses Tesseract) |
+| `--ocr-server-header <header>` | Extra HTTP header for OCR server requests, as `"Name: Value"`. Repeatable | — |
 | `--tessdata-path <path>` | Path to tessdata directory | — |
 | `--num-workers <n>` | Pages to OCR in parallel | CPU cores - 1 |
 | `--max-pages <n>` | Maximum pages per file | `1000` |
@@ -97,6 +139,10 @@ lit batch-parse [options] <input-dir> <output-dir>
 | `--extension <ext>` | Only process this extension (e.g., `".pdf"`) | — (all supported) |
 | `--password <password>` | Password for encrypted/protected documents (applied to all files) | — |
 | `-q, --quiet` | Suppress progress output | — |
+
+`batch-parse` accepts the same [extraction options](#extraction-options) as `lit parse`: `--extract-images`, `--extract-vector-graphics`, `--extract-annotations`, `--extract-form-fields`, `--extract-structure-tree`, `--extract-blocks`, `--extract-content-bounds`, `--extract-xfa-packets`, `--extract-text-metadata`, and `--complexity`.
+
+It does **not** accept `--target-pages`, `--preserve-small-text`, `--image-mode`, `--image-output-dir`, `--no-links`, or `--keep-headers-footers`. Use `lit parse` per file when you need those.
 
 ### Examples
 
@@ -151,6 +197,47 @@ lit screenshot document.pdf --target-pages "1-5" --dpi 300 -o ./pages
 
 # Specific pages only
 lit screenshot document.pdf --target-pages "1,5,10" -o ./pages
+```
+
+---
+
+## `lit is-complex`
+
+Check whether a document needs OCR or heavier parsing — a cheap pre-parse pass over the text layer only (no rasterization, no OCR). See the [Document Complexity guide](/liteparse/guides/complexity/) for details.
+
+```
+lit is-complex [options] <file>
+```
+
+The command prints per-page JSON to **stdout**, a human-readable verdict to **stderr**, and exits **non-zero when any page needs OCR** — so it works as a shell predicate or a `jq` source.
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `file` | Path to the document file |
+
+### Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--compact` | Emit dense, whitespace-free JSON instead of pretty-printed | — |
+| `--max-pages <n>` | Maximum pages to check | `1000` |
+| `--target-pages <pages>` | Pages to check (e.g., `"1-5,10,15-20"`) | — (all pages) |
+| `--password <password>` | Password for encrypted/protected documents | — |
+| `-q, --quiet` | Suppress the stderr verdict | — |
+
+### Examples
+
+```bash
+# Print the complexity verdict and per-page JSON
+lit is-complex document.pdf
+
+# Use as a shell predicate: only parse with --no-ocr when simple
+lit is-complex document.pdf --quiet && lit parse document.pdf --no-ocr
+
+# List the page numbers that need OCR
+lit is-complex document.pdf --compact | jq '[.[] | select(.needs_ocr) | .page_number]'
 ```
 
 ---

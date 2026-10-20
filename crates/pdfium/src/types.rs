@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RectF {
     pub left: f32,
     pub top: f32,

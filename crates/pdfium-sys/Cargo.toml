@@ -1,6 +1,6 @@
 [package]
 name = "liteparse-pdfium-sys"
-version = "1.1.1"
+version = "1.12.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

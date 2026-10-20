@@ -1,7 +1,7 @@
 #!/bin/sh
 # Smoke test for the musl Node binding, run inside node:20-alpine.
 # Assumes the build artifact has been downloaded into /work/packages/node and
-# `npx tsc` has produced dist/.
+# `npm run build:ts` has produced dist/.
 set -eux
 
 cd /work/packages/node
@@ -20,11 +20,5 @@ node -e '
   console.log("raw .node loaded ok");
 '
 
-# Then run the actual smoke check through the public lib entry point.
-node -e '
-  import("./dist/lib.js").then(async ({ LiteParse }) => {
-    const p = new LiteParse({ ocrEnabled: false, quiet: true });
-    console.log("Config:", JSON.stringify(p.getConfig()));
-    console.log("Native module loaded successfully");
-  }).catch(e => { console.error(e); process.exit(1); });
-'
+# Then run the entry-point suite, which covers both the ESM and CJS builds.
+npm test

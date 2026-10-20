@@ -4,12 +4,16 @@ use crate::ffi;
 use crate::page::Page;
 use crate::types::{CharBox, Color, Matrix, RectF, TextRect};
 
-pub struct TextPage<'page> {
+/// Extracted text content of a [`Page`].
+///
+/// `'page` is the borrow of the parent page; `'lib` carries the PDFium-lock
+/// lifetime through so that no FFI call can occur after the lock is released.
+pub struct TextPage<'page, 'lib: 'page> {
     pub(crate) handle: pdfium_sys::FPDF_TEXTPAGE,
-    pub(crate) _page: PhantomData<&'page Page<'page>>,
+    pub(crate) _page: PhantomData<&'page Page<'page, 'lib>>,
 }
 
-impl TextPage<'_> {
+impl<'page, 'lib: 'page> TextPage<'page, 'lib> {
     pub fn char_count(&self) -> i32 {
         unsafe { ffi!(FPDFText_CountChars(self.handle)) }
     }
@@ -40,6 +44,46 @@ impl TextPage<'_> {
             text_page: self,
             index,
         }
+    }
+
+    /// Fill `buf` with per-character records starting at `start` using the
+    /// fork's `FPDFText_GetCharInfoBatch` (chromium/8028+), replacing several
+    /// FFI round-trips per character with one per chunk. Returns the number
+    /// of records written (0 at end of range), or `None` when the loaded
+    /// pdfium build predates the batch API — callers must fall back to the
+    /// per-character getters.
+    ///
+    /// Record fields mirror the single-char getters exactly: raw page-space
+    /// boxes, `char_type` as the raw `CPDF_TextPage::CharType` value
+    /// (1 = generated, 2 = no-unicode-mapping), and `text_render_mode` of the
+    /// char's text object (-1 when it has none).
+    pub fn char_infos_batch(
+        &self,
+        start: i32,
+        buf: &mut [pdfium_sys::FPDF_CHARINFO_LP],
+    ) -> Option<usize> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let written = {
+            let batch_fn = pdfium_sys::dynamic::pdfium().FPDFText_GetCharInfoBatch?;
+            if buf.is_empty() {
+                return Some(0);
+            }
+            unsafe { batch_fn(self.handle, start, buf.len() as i32, buf.as_mut_ptr()) }
+        };
+        #[cfg(target_arch = "wasm32")]
+        if buf.is_empty() {
+            return Some(0);
+        }
+        #[cfg(target_arch = "wasm32")]
+        let written = unsafe {
+            pdfium_sys::FPDFText_GetCharInfoBatch(
+                self.handle,
+                start,
+                buf.len() as i32,
+                buf.as_mut_ptr(),
+            )
+        };
+        Some(written.max(0) as usize)
     }
 
     /// Count rectangular areas occupied by a text segment.
@@ -150,7 +194,7 @@ impl TextPage<'_> {
     }
 }
 
-impl Drop for TextPage<'_> {
+impl Drop for TextPage<'_, '_> {
     fn drop(&mut self) {
         unsafe { ffi!(FPDFText_ClosePage(self.handle)) };
     }
@@ -159,11 +203,31 @@ impl Drop for TextPage<'_> {
 // -- TextChar: zero-cost view into a TextPage --
 
 pub struct TextChar<'tp> {
-    text_page: &'tp TextPage<'tp>,
+    // We don't care about the inner lifetimes here — we only need to know
+    // that we're borrowing the text page (and transitively the library lock)
+    // for at least `'tp`. Using `'tp` for the inner params makes the type
+    // covariant in `'tp` and lets borrow-checking flow naturally from the
+    // outer borrow.
+    text_page: &'tp TextPage<'tp, 'tp>,
     pub(crate) index: i32,
 }
 
 impl TextChar<'_> {
+    /// The glyph's origin in page space (`FPDFText_GetCharOrigin`): the point
+    /// the text matrix places on the baseline, in unrotated PDF user units.
+    pub fn origin(&self) -> Option<(f64, f64)> {
+        let (mut x, mut y) = (0.0f64, 0.0f64);
+        let ok = unsafe {
+            ffi!(FPDFText_GetCharOrigin(
+                self.text_page.handle,
+                self.index,
+                &mut x,
+                &mut y
+            ))
+        };
+        (ok != 0).then_some((x, y))
+    }
+
     pub fn unicode(&self) -> u32 {
         unsafe { ffi!(FPDFText_GetUnicode(self.text_page.handle, self.index)) }
     }
@@ -231,6 +295,19 @@ impl TextChar<'_> {
     pub fn text_object(&self) -> Option<pdfium_sys::FPDF_PAGEOBJECT> {
         let obj = unsafe { ffi!(FPDFText_GetTextObject(self.text_page.handle, self.index)) };
         if obj.is_null() { None } else { Some(obj) }
+    }
+
+    /// Advance width of the ASCII space (char code 0x20) in this character's
+    /// font, expressed per em (i.e. for `font_size = 1.0`). Multiply by the
+    /// actual font size to get the space width in text-space points. Returns
+    /// `None` when the font or glyph is unavailable. Used to set a font-aware
+    /// threshold for detecting word boundaries when PDFium omits space glyphs.
+    pub fn font_space_width(&self) -> Option<f32> {
+        let obj = self.text_object()?;
+        let font = unsafe { crate::font::Font::from_text_object(obj)? };
+        font.glyph_width_from_char_code(0x20, 1.0)
+            .filter(|w| *w > 0.0)
+            .or_else(|| font.glyph_width(0x20, 1.0).filter(|w| *w > 0.0))
     }
 
     /// Get stroke color (r, g, b, a).
@@ -391,6 +468,11 @@ impl TextChar<'_> {
         unsafe { ffi!(FPDFText_IsGenerated(self.text_page.handle, self.index)) == 1 }
     }
 
+    /// A hyphen pdfium found at the end of a line; its unicode reads as 0x02.
+    pub fn is_hyphen(&self) -> bool {
+        unsafe { ffi!(FPDFText_IsHyphen(self.text_page.handle, self.index)) == 1 }
+    }
+
     pub fn has_unicode_map_error(&self) -> bool {
         unsafe {
             ffi!(FPDFText_HasUnicodeMapError(
@@ -404,7 +486,7 @@ impl TextChar<'_> {
 // -- TextCharIter --
 
 pub struct TextCharIter<'tp> {
-    text_page: &'tp TextPage<'tp>,
+    text_page: &'tp TextPage<'tp, 'tp>,
     index: i32,
     count: i32,
 }

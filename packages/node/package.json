@@ -1,18 +1,26 @@
 {
   "name": "@llamaindex/liteparse",
-  "version": "2.0.6",
+  "version": "2.16.0",
   "description": "Fast, lightweight PDF and document parsing with spatial text extraction",
   "type": "module",
-  "main": "./dist/lib.js",
+  "main": "./dist/lib.cjs",
+  "module": "./dist/lib.js",
   "types": "./dist/lib.d.ts",
+  "sideEffects": false,
   "bin": {
     "lit": "./dist/cli.js",
     "liteparse": "./dist/cli.js"
   },
   "exports": {
     ".": {
-      "types": "./dist/lib.d.ts",
-      "import": "./dist/lib.js"
+      "import": {
+        "types": "./dist/lib.d.ts",
+        "default": "./dist/lib.js"
+      },
+      "require": {
+        "types": "./dist/lib.d.cts",
+        "default": "./dist/lib.cjs"
+      }
     },
     "./package.json": "./package.json"
   },
@@ -41,8 +49,9 @@
   "scripts": {
     "build:rs": "napi build --cargo-cwd ../../crates/liteparse-napi --platform --release --js false --dts native.d.ts .",
     "build:pdfium": "bash scripts/copy-pdfium.sh .",
-    "build:ts": "tsc",
+    "build:ts": "node scripts/clean-dist.mjs && tsc --noEmit && tsup",
     "build": "npm run build:rs && npm run build:pdfium && npm run build:ts",
+    "test": "npm run build:ts && node --test tests/",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -51,16 +60,17 @@
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4",
     "@types/node": "^22.0.0",
+    "tsup": "^8.5.0",
     "typescript": "~5.9.2"
   },
   "optionalDependencies": {
-    "@llamaindex/liteparse-darwin-arm64": "2.0.6",
-    "@llamaindex/liteparse-darwin-x64": "2.0.6",
-    "@llamaindex/liteparse-linux-arm64-gnu": "2.0.6",
-    "@llamaindex/liteparse-linux-x64-gnu": "2.0.6",
-    "@llamaindex/liteparse-win32-arm64-msvc": "2.0.6",
-    "@llamaindex/liteparse-win32-x64-msvc": "2.0.6",
-    "@llamaindex/liteparse-linux-x64-musl": "2.0.6"
+    "@llamaindex/liteparse-darwin-arm64": "2.16.0",
+    "@llamaindex/liteparse-darwin-x64": "2.16.0",
+    "@llamaindex/liteparse-linux-arm64-gnu": "2.16.0",
+    "@llamaindex/liteparse-linux-x64-gnu": "2.16.0",
+    "@llamaindex/liteparse-win32-arm64-msvc": "2.16.0",
+    "@llamaindex/liteparse-win32-x64-msvc": "2.16.0",
+    "@llamaindex/liteparse-linux-x64-musl": "2.16.0"
   },
   "engines": {
     "node": ">=18.0.0"

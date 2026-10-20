@@ -43,8 +43,18 @@ pub extern "C" fn pthread_mutex_destroy(_mutex: *mut u8) -> i32 {
 //   - __wasm_setjmp_test(table, env) -> label — 2 params
 //
 // The table is a flat array of (env, label) pairs on the stack, zero-terminated.
+//
+// These are FALLBACK stubs, compiled only when the linked pdfium build ships no
+// standalone libsetjmp.a (older releases that fold setjmp into libc.a). When
+// libsetjmp.a IS present, build.rs sets `have_libsetjmp` and these are dropped
+// so the real runtime resolves the symbols instead — critically its
+// __wasm_longjmp actually throws the __c_longjmp tag, whereas the stub below can
+// only trap. Leaving the stub in alongside libsetjmp.a lets it shadow the real
+// implementation (link order under --allow-multiple-definition), which turns
+// FreeType's setjmp error recovery on malformed fonts into a module abort.
 // ---------------------------------------------------------------------------
 
+#[cfg(not(have_libsetjmp))]
 #[unsafe(no_mangle)]
 pub extern "C" fn __wasm_setjmp(env: u32, label: u32, table: *mut u32) {
     unsafe {
@@ -61,6 +71,7 @@ pub extern "C" fn __wasm_setjmp(env: u32, label: u32, table: *mut u32) {
     }
 }
 
+#[cfg(not(have_libsetjmp))]
 #[unsafe(no_mangle)]
 pub extern "C" fn __wasm_setjmp_test(table: *const u32, env: u32) -> u32 {
     unsafe {
@@ -78,10 +89,12 @@ pub extern "C" fn __wasm_setjmp_test(table: *const u32, env: u32) -> u32 {
     }
 }
 
+#[cfg(not(have_libsetjmp))]
 #[unsafe(no_mangle)]
 pub extern "C" fn __wasm_longjmp(_env: *mut u8, _val: i32) {
     // longjmp throws the __c_longjmp WASM exception tag, which we can't do
-    // from Rust. Trap instead — in practice, FreeType's setjmp error recovery
-    // rarely triggers during normal PDF parsing.
+    // from Rust. Trap instead. This branch only compiles when no libsetjmp.a is
+    // linked (see the module note above); with libsetjmp.a present the real
+    // runtime provides a __wasm_longjmp that unwinds correctly.
     core::arch::wasm32::unreachable();
 }

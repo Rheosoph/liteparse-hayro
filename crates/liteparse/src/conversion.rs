@@ -983,6 +983,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rasterize_svg_returns_straight_rgba_at_css_pixel_size() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect width="4" height="2" fill="red" fill-opacity="0.5"/></svg>"#;
+        let (rgba, width, height) = rasterize_svg(svg).unwrap();
+        assert_eq!((width, height), (4, 2));
+        assert_eq!(rgba.len(), 4 * 2 * 4);
+        let pixel = &rgba[..4];
+        assert!((127..=128).contains(&pixel[3]), "{pixel:?}");
+        assert!(pixel[0] >= 254 && pixel[1] == 0 && pixel[2] == 0, "{pixel:?}");
+    }
+
+    #[test]
     fn test_is_pdf() {
         assert!(is_pdf("foo.pdf"));
         assert!(is_pdf("foo.PDF"));
